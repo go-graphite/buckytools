@@ -78,7 +78,7 @@ func (msf *metricSyncerFlags) registerFlags(fs *flag.FlagSet) {
 
 	fs.IntVar(&msf.syncSpeedUpInterval, "sync-speed-up-interval", 600, "Increase sync speed metrics-per-second by 1 at the specified interval (seconds). Requires -go-carbon-health-check. To disable, set it to 0 or -1.")
 	fs.IntVar(&msf.metricsPerSecond, "metrics-per-second", 1, "Sync rate (metrics per second) on each graphite storage (go-carbon) node. Requires -go-carbon-health-check.")
-	fs.BoolVar(&msf.noRandomEasing, "no-random-easing", false, "Disable randomly slowing down MetricsPerSecond. Requires -go-carbon-health-check.")
+	fs.BoolVar(&msf.noRandomEasing, "no-random-easing", false, "Disable randomly slowing down metricsPerSecond. Requires -go-carbon-health-check.")
 
 	fs.StringVar(&msf.graphiteEndpoint, "graphite-endpoint", "", "Send internal stats to graphite ingestion endpoint")
 	fs.StringVar(&msf.graphiteMetricsPrefix, "graphite-metrics-prefix", "carbon.buckytools", "Internal graphite metric prefix")
@@ -87,7 +87,7 @@ func (msf *metricSyncerFlags) registerFlags(fs *flag.FlagSet) {
 
 	fs.Int64Var(&msf.errorTolerance, "error-tolerance", 0, "How many copy/delete errors during sync not trigger error exit code.")
 	fs.StringVar(&msf.metricErrFile, "metric-err-file", "", "Logfile to dump sync errors")
-	fs.StringVar(&msf.jobStateFile, "job-state-file", "", "If this file is provided the job will continue the process skipping already completed subjobs")
+	fs.StringVar(&msf.jobStateFile, "job-state-file", "", "If this file is provided the job will continue the process skipping already completed subjobs (copied metrics)")
 
 	fs.IntVar(&msf.testingHelper.workerSleepSeconds, "testing.worker-sleep-seconds", 0, "Testing helper flag: make worker sleep.")
 }
@@ -441,7 +441,7 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 				}
 			}
 
-			// We only Delete if there are no errors present
+			// We only delete if there are no errors present
 			if ms.flags.delete {
 				deleteStart := time.Now()
 
@@ -782,7 +782,7 @@ func (ms *metricSyncer) extractCompletedJobs() map[string]map[string]map[string]
 	defer file.Close()
 	reader := bufio.NewReader(file)
 	cJobs := make(map[string]map[string]map[string]bool) // completed jobs {dst: {scr: []}}
-	_, _, _ = reader.ReadLine()                          // need to skip first line with jenkins job params
+	_, _, _ = reader.ReadLine()                          // need to skip first line with bucky process params
 	cJob := syncJob{}
 	for {
 		line, _, err := reader.ReadLine()
