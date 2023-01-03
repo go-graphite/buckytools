@@ -20,7 +20,7 @@ func nodeStr(n hashing.Node) string { return fmt.Sprintf("%s:%d", n.Server, n.Po
 func main() {
 	// 1. populate metrics
 	// 2. start three buckyd instances
-	// 3. run rebalance
+	// 3. run backfill
 
 	keepTestData := flag.Bool("keep-testdata", false, "keep test data after test")
 	flag.Parse()

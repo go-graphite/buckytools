@@ -49,7 +49,7 @@ Set -offload=true to speed up rebalance.`
 
 	msFlags.registerFlags(c.Flag)
 	c.Flag.BoolVar(&listForce, "f", false, "Force the remote daemons to rebuild their cache.")
-	c.Flag.StringVar(&rebalanceConfig.allowedDsts, "allowed-dsts", "", "Only copy/rebanace metrics to the allowed destinations (ip1:port,ip2:port). By default (i.e. empty), all dsts are allowed.")
+	c.Flag.StringVar(&rebalanceConfig.allowedDsts, "allowed-dsts", "", "Only copy/rebalance metrics to the allowed destinations (ip1:port,ip2:port). By default (i.e. empty), all dsts are allowed.")
 }
 
 // countMap returns the number of metrics in a server -> metrics mapping
@@ -75,7 +75,7 @@ func RebalanceMetrics(extraHostPorts []string) error {
 	hostPorts = append(hostPorts, extraHostPorts...)
 	if len(hostPorts) == 0 || !Cluster.Healthy {
 		log.Printf("Cluster is unhealthy or error finding cluster members.")
-		return fmt.Errorf("Cluster is unhealthy.")
+		return fmt.Errorf("cluster is unhealthy")
 	}
 
 	metricMap, err := InconsistentMetrics(hostPorts)
@@ -98,8 +98,8 @@ func RebalanceMetrics(extraHostPorts []string) error {
 			node := Cluster.Hash.GetNode(m)
 			dst := fmt.Sprintf("%s:%s", node.Server, Cluster.Port)
 
-			job.oldName = m
-			job.newName = m
+			job.OldName = m
+			job.NewName = m
 
 			moves[src]++
 

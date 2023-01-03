@@ -29,14 +29,15 @@ func init() {
 
 	c.Flag.StringVar(&bf2Cmd.srcClusterSeed, "src-cluster-seed", "", "Source cluster seed to copy metrics from.")
 	c.Flag.StringVar(&bf2Cmd.dstClusterSeed, "dst-cluster-seed", "", "Destination cluster seed to copy metrics to.")
-	c.Flag.StringVar(&bf2Cmd.metricMapFile, "metric-map-file", "", "File paht to the new metric mapping.")
+	c.Flag.StringVar(&bf2Cmd.metricMapFile, "metric-map-file", "", "File path to the new metric mapping.")
 
 	msFlags.registerFlags(c.Flag)
 
-	bf2Cmd.metricSyncer = newMetricSyncer(msFlags)
 }
 
 func (bf2 *backfill2Command) do(c Command) int {
+	bf2.metricSyncer = newMetricSyncer(msFlags)
+
 	bf2.flags.verbose = Verbose
 
 	if bf2.srcClusterSeed == "" || bf2.dstClusterSeed == "" {
@@ -79,7 +80,7 @@ func (bf2 *backfill2Command) do(c Command) int {
 		if jobs[dstServer] == nil {
 			jobs[dstServer] = map[string][]*syncJob{}
 		}
-		jobs[dstServer][srcServer] = append(jobs[dstServer][srcServer], &syncJob{oldName: srcm, newName: dstm})
+		jobs[dstServer][srcServer] = append(jobs[dstServer][srcServer], &syncJob{OldName: srcm, NewName: dstm})
 	}
 
 	log.Println("Copying Stats:")

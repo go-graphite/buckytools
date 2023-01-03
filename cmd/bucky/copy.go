@@ -23,14 +23,12 @@ func init() {
 	c.Flag.StringVar(&copyCmd.src, "src", "", "Source host to copy metrics from.")
 	c.Flag.StringVar(&copyCmd.dst, "dst", "", "Destination host to copy metrics to.")
 	c.Flag.BoolVar(&copyCmd.listForce, "f", false, "Force the remote daemons to rebuild their cache.")
-
 	msFlags.registerFlags(c.Flag)
-
-	copyCmd.metricSyncer = newMetricSyncer(msFlags)
 }
 
 // rebalanceCommand runs this subcommand.
 func (cc *copyCommand) do(c Command) int {
+	cc.metricSyncer = newMetricSyncer(msFlags)
 	cc.flags.verbose = Verbose
 
 	if cc.src == "" || cc.dst == "" {
@@ -48,7 +46,7 @@ func (cc *copyCommand) do(c Command) int {
 
 	jobs := map[string]map[string][]*syncJob{cc.dst: {}}
 	for _, m := range metricsMap[cc.src] {
-		jobs[cc.dst][cc.src] = append(jobs[cc.dst][cc.src], &syncJob{oldName: m, newName: m})
+		jobs[cc.dst][cc.src] = append(jobs[cc.dst][cc.src], &syncJob{OldName: m, NewName: m})
 	}
 
 	err = cc.run(jobs)

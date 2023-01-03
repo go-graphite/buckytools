@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -50,6 +52,7 @@ type metricSyncerFlags struct {
 	graphiteStatInterval  int
 	errorTolerance        int64
 	metricErrFile         string
+	jobStateFile          string
 
 	testingHelper struct {
 		workerSleepSeconds int
@@ -73,7 +76,7 @@ func (msf *metricSyncerFlags) registerFlags(fs *flag.FlagSet) {
 	fs.StringVar(&msf.goCarbonPort, "go-carbon-port", "8080", "Set carbon-server port to retrieve go-carbon /admin/info")
 	fs.Float64Var(&msf.goCarbonCacheThreshold, "go-carbon-cache-threshold", 0.75, "Go-Carbon cache threshold")
 
-	fs.IntVar(&msf.syncSpeedUpInterval, "sync-speed-up-interval", 600, "Incraese sync speed metrics-per-second by 1 at the specified interval (seconds). Requires -go-carbon-health-check. To disbale, set it to 0 or -1.")
+	fs.IntVar(&msf.syncSpeedUpInterval, "sync-speed-up-interval", 600, "Increase sync speed metrics-per-second by 1 at the specified interval (seconds). Requires -go-carbon-health-check. To disable, set it to 0 or -1.")
 	fs.IntVar(&msf.metricsPerSecond, "metrics-per-second", 1, "Sync rate (metrics per second) on each graphite storage (go-carbon) node. Requires -go-carbon-health-check.")
 	fs.BoolVar(&msf.noRandomEasing, "no-random-easing", false, "Disable randomly slowing down metricsPerSecond. Requires -go-carbon-health-check.")
 
@@ -84,6 +87,7 @@ func (msf *metricSyncerFlags) registerFlags(fs *flag.FlagSet) {
 
 	fs.Int64Var(&msf.errorTolerance, "error-tolerance", 0, "How many copy/delete errors during sync not trigger error exit code.")
 	fs.StringVar(&msf.metricErrFile, "metric-err-file", "", "Logfile to dump sync errors")
+	fs.StringVar(&msf.jobStateFile, "job-state-file", "", "If this file is provided the job will continue the process skipping already completed subjobs (copied metrics)")
 
 	fs.IntVar(&msf.testingHelper.workerSleepSeconds, "testing.worker-sleep-seconds", 0, "Testing helper flag: make worker sleep.")
 }
@@ -91,9 +95,10 @@ func (msf *metricSyncerFlags) registerFlags(fs *flag.FlagSet) {
 type metricSyncer struct {
 	flags *metricSyncerFlags
 
-	metricErrLogger *log.Logger
-
-	stat struct {
+	metricErrLogger   *log.Logger
+	jobStateLogger    *log.Logger
+	completedJobsFile string
+	stat              struct {
 		totalJobs    int64
 		finishedJobs int64
 		notFound     int64
@@ -127,18 +132,23 @@ func newMetricSyncer(flags *metricSyncerFlags) *metricSyncer {
 	var ms metricSyncer
 
 	ms.flags = flags
-	ms.metricErrLogger = nil
 	if flags.metricErrFile != "" {
-		f, err := os.OpenFile(flags.metricErrFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Fatalf("Can't open file %s because of %v", flags.metricErrFile, err)
-		}
-		ms.metricErrLogger = log.New(f, "", log.LstdFlags)
+		ms.metricErrLogger = createLogger(flags.metricErrFile, log.LstdFlags)
 	}
-
+	if flags.jobStateFile != "" {
+		ms.completedJobsFile = flags.jobStateFile
+		ms.jobStateLogger = createLogger(flags.jobStateFile, 0)
+	}
 	ms.stat.nodes = map[string]*syncPerNodeStat{}
-
 	return &ms
+}
+
+func createLogger(loggerFile string, logFlag int) *log.Logger {
+	f, err := os.OpenFile(loggerFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Can't open file %s because of %v", loggerFile, err)
+	}
+	return log.New(f, "", logFlag)
 }
 
 func (ms *metricSyncer) restTime() int64 {
@@ -146,18 +156,21 @@ func (ms *metricSyncer) restTime() int64 {
 }
 
 type syncJob struct {
-	srcServer string
-	dstServer string
-	oldName   string
-	newName   string
+	SrcServer string
+	DstServer string
+	OldName   string
+	NewName   string
 }
 
 func (ms *metricSyncer) run(jobsd map[string]map[string][]*syncJob) error {
 	totalJobs := ms.countJobs(jobsd)
+	if ms.completedJobsFile != "" {
+		ms.filterCompletedJobs(jobsd)
+	}
 	log.Printf("Syncing %d metrics. Copy offload: %t.", totalJobs, ms.flags.offloadFetch)
 
 	if ms.flags.noop {
-		return errors.New("Halting.  No-op mode enganged.")
+		return errors.New("Halting.  No-op mode engaged.")
 	}
 
 	jobcs := map[string]map[string]chan *syncJob{}
@@ -177,7 +190,7 @@ func (ms *metricSyncer) run(jobsd map[string]map[string][]*syncJob) error {
 			ms.stat.nodes[src] = &syncPerNodeStat{}
 			ms.stat.totalJobs += int64(len(jobs))
 
-			// Why src nodes have 1.5x workers: eading data is less
+			// Why src nodes have 1.5x workers: reading data is less
 			// expensive than writing data, so it should be ok for
 			// source node to receive some more reading requests.
 			if _, ok := srcThrottling[src]; !ok {
@@ -223,8 +236,8 @@ func (ms *metricSyncer) run(jobsd map[string]map[string][]*syncJob) error {
 				jobc := jobcs[dst][src]
 
 				for _, job := range jobs {
-					job.srcServer = src
-					job.dstServer = dst
+					job.SrcServer = src
+					job.DstServer = dst
 					jobc <- job
 					atomic.AddInt64(&progress, 1)
 				}
@@ -277,7 +290,7 @@ func (ms *metricSyncer) run(jobsd map[string]map[string][]*syncJob) error {
 
 	if (!ms.flags.ignore404 && ms.stat.notFound > 0) || ms.stat.copyError > ms.flags.errorTolerance || ms.stat.deleteError > ms.flags.errorTolerance {
 		log.Println("Errors are present in sync.")
-		return fmt.Errorf("Errors present.")
+		return fmt.Errorf("errors present")
 	}
 
 	return nil
@@ -294,7 +307,7 @@ func (ms *metricSyncer) countJobs(jobsd map[string]map[string][]*syncJob) int {
 	return c
 }
 
-func (ms *metricSyncer) metriclog(name string, where string, src bool) {
+func (ms *metricSyncer) errorMetricLog(name string, where string, src bool) {
 	if ms.metricErrLogger != nil {
 		what := "dst"
 		if src {
@@ -303,15 +316,21 @@ func (ms *metricSyncer) metriclog(name string, where string, src bool) {
 		ms.metricErrLogger.Printf("%s,%s,%s", what, name, where)
 	}
 }
+func (ms *metricSyncer) completeJobLog(job *syncJob) {
+	if ms.jobStateLogger != nil {
+		b, _ := json.Marshal(job)
+		ms.jobStateLogger.Println(string(b))
+	}
+}
 
 func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan struct{}, wg *sync.WaitGroup) {
 	for job := range jobc {
 		func() {
-			src, dst := job.srcServer, job.dstServer
+			src, dst := job.SrcServer, job.DstServer
 
 			// Make sure that src servers doesn't receive too many
-			// read requests If this interfers with sync speed-up
-			// with go-cabron health check, we can bypass the issue
+			// read requests If this interferes with sync speed-up
+			// with go-carbon health check, we can bypass the issue
 			// by increase the worker count.
 			srcThrottling[src] <- struct{}{}
 
@@ -334,8 +353,8 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 
 			if ms.flags.verbose {
 				log.Printf("Relocating [%s] %s => [%s] %s  Delete Source: %t",
-					src, job.oldName,
-					dst, job.newName, ms.flags.delete)
+					src, job.OldName,
+					dst, job.NewName, ms.flags.delete)
 			}
 
 			if ms.flags.testingHelper.workerSleepSeconds > 0 {
@@ -345,7 +364,7 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 			var mhstats *metricHealStats
 			if ms.flags.offloadFetch {
 				var err error
-				mhstats, err = CopyMetric(src, dst, job.oldName, job.newName)
+				mhstats, err = CopyMetric(src, dst, job.OldName, job.NewName)
 				if err != nil {
 					// errors already logged in the func
 					if errors.Is(err, errNotFound) {
@@ -353,46 +372,46 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 					} else if errors.Is(err, errCantReadMetric) {
 						atomic.AddInt64(&ms.stat.copyError, 1)
 						atomic.AddInt64(&ms.stat.nodes[src].copyError, 1)
-						ms.metriclog(job.oldName, src, true)
+						ms.errorMetricLog(job.OldName, src, true)
 					} else if errors.Is(err, errCantWriteMetric) {
 						atomic.AddInt64(&ms.stat.copyError, 1)
 						atomic.AddInt64(&ms.stat.nodes[dst].copyError, 1)
-						ms.metriclog(job.newName, dst, false)
+						ms.errorMetricLog(job.NewName, dst, false)
 					} else {
 						// it's ambiguous - let's count error for both src and dst
 						atomic.AddInt64(&ms.stat.copyError, 1)
 						atomic.AddInt64(&ms.stat.nodes[src].copyError, 1)
 						atomic.AddInt64(&ms.stat.nodes[dst].copyError, 1)
-						ms.metriclog(job.oldName, src, true)
-						ms.metriclog(job.newName, dst, false)
+						ms.errorMetricLog(job.OldName, src, true)
+						ms.errorMetricLog(job.NewName, dst, false)
 					}
 
 					return
 				}
 			} else {
-				metric, err := GetMetricData(src, job.oldName)
+				metric, err := GetMetricData(src, job.OldName)
 				if err != nil {
-					// errors already loggged in the func
+					// errors already logged in the func
 					if errors.Is(err, errNotFound) {
 						atomic.AddInt64(&ms.stat.notFound, 1)
 					} else {
 						atomic.AddInt64(&ms.stat.copyError, 1)
 						atomic.AddInt64(&ms.stat.nodes[src].copyError, 1)
-						ms.metriclog(job.oldName, src, true)
+						ms.errorMetricLog(job.OldName, src, true)
 					}
 
 					return
 				}
-				metric.Name = job.newName
+				metric.Name = job.NewName
 				mhstats, err = PostMetric(dst, metric)
 				if err != nil {
-					// errors already loggged in the func
+					// errors already logged in the func
 					if errors.Is(err, errNotFound) {
 						atomic.AddInt64(&ms.stat.notFound, 1)
 					} else {
 						atomic.AddInt64(&ms.stat.copyError, 1)
 						atomic.AddInt64(&ms.stat.nodes[dst].copyError, 1)
-						ms.metriclog(job.newName, dst, false)
+						ms.errorMetricLog(job.NewName, dst, false)
 					}
 
 					return
@@ -426,9 +445,9 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 			if ms.flags.delete {
 				deleteStart := time.Now()
 
-				err := DeleteMetric(src, job.oldName)
+				err := DeleteMetric(src, job.OldName)
 				if err != nil {
-					// errors already loggged in the func
+					// errors already logged in the func
 					atomic.AddInt64(&ms.stat.deleteError, 1)
 					atomic.AddInt64(&ms.stat.nodes[src].deleteError, 1)
 				}
@@ -437,6 +456,7 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 				atomic.AddInt64(&ms.stat.time.delete.total, int64(time.Since(deleteStart)))
 			}
 		}()
+		ms.completeJobLog(job)
 	}
 
 	wg.Done()
@@ -730,4 +750,59 @@ func (ms *metricSyncer) getNodeName(src string) string {
 
 	sort.Strings(names)
 	return strings.ReplaceAll(names[0], ".", "_")
+}
+
+// filters in place
+// filter out completed jobs from the jobsd
+func (ms *metricSyncer) filterCompletedJobs(jobsd map[string]map[string][]*syncJob) {
+	cJobs := ms.extractCompletedJobs()
+	filteredCount := 0
+	for dst, srcJobs := range cJobs {
+		for src, cJobsMap := range srcJobs {
+			var filteredJobs []*syncJob
+			for _, job := range jobsd[dst][src] {
+				if _, ok := cJobsMap[fmt.Sprintf("%s|%s", job.OldName, job.NewName)]; !ok {
+					filteredJobs = append(filteredJobs, job)
+				} else {
+					filteredCount += 1
+				}
+			}
+			jobsd[dst][src] = filteredJobs
+		}
+	}
+	log.Printf("filtered out %d completed jobs", filteredCount)
+}
+
+func (ms *metricSyncer) extractCompletedJobs() map[string]map[string]map[string]bool {
+	// return {dst: {src: {"oldName|NewName": true}}}
+	file, err := os.Open(ms.completedJobsFile)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	cJobs := make(map[string]map[string]map[string]bool) // completed jobs {dst: {scr: []}}
+	_, _, _ = reader.ReadLine()                          // need to skip first line with bucky process params
+	cJob := syncJob{}
+	for {
+		line, _, err := reader.ReadLine()
+		if err == io.EOF {
+			break
+		}
+		err = json.Unmarshal(line, &cJob)
+
+		if err != nil {
+			log.Printf("Can't unmarshal completed job line: %e, line: %s", err, line)
+			continue
+		}
+
+		if _, ok := cJobs[cJob.DstServer]; !ok {
+			cJobs[cJob.DstServer] = make(map[string]map[string]bool)
+		}
+		if _, ok := cJobs[cJob.DstServer][cJob.SrcServer]; !ok {
+			cJobs[cJob.DstServer][cJob.SrcServer] = make(map[string]bool) // oldName + | + newName
+		}
+		cJobs[cJob.DstServer][cJob.SrcServer][fmt.Sprintf("%s|%s", cJob.OldName, cJob.NewName)] = true
+	}
+	return cJobs
 }
