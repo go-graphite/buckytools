@@ -137,9 +137,6 @@ func NewNodeParser(s string) (Node, error) {
 			}
 		case 2:
 			// server:port:instance
-			if v == ':' || v == '=' {
-				return Node{}, fmt.Errorf("Error parsing instance in %s", s)
-			}
 			instance = append(instance, v)
 		default:
 			panic("FSM parsing failure")
