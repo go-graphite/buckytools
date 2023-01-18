@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"log"
 	"os"
 	"sort"
 	"syscall"
@@ -60,43 +61,50 @@ same location.
 
 // modifyCommand runs this subcommand.
 func modifyCommand(c Command) int {
-	resizeFile, err := os.Open(resizeFilename)
+	resizeFile, err := os.OpenFile(resizeFilename, os.O_RDWR, 0644)
 	if err != nil {
-		panic(err)
+		log.Fatalf("could not open file %q read-write: %v", resizeFilename, err)
 	}
+
 	if err = syscall.Flock(int(resizeFile.Fd()), syscall.LOCK_EX); err != nil {
 		resizeFile.Close()
-		panic(err)
+		log.Fatalf("could not flock(2) file %q: %v", resizeFilename, err)
 	}
 	defer resizeFile.Close()
 
-	backupFile, err := os.Create(resizeFilename + ".bak")
+	backupFilename := resizeFilename + ".bak"
+	backupFile, err := os.Create(backupFilename)
 	if err != nil {
-		panic(err)
+		log.Fatalf("could not create backup file %q: %v", backupFilename, err)
 	}
 	if _, err := io.Copy(backupFile, resizeFile); err != nil {
-		panic(err)
+		log.Fatalf(
+			"could not copy data from original file %q to backup file %q: %v",
+			resizeFilename,
+			backupFilename,
+			err,
+		)
 	}
 	if err := backupFile.Close(); err != nil {
-		panic(err)
+		log.Fatalf("could not close backup file %q: %v", backupFilename, err)
 	}
 	if err := resizeFile.Truncate(0); err != nil {
-		panic(err)
+		log.Fatalf("could not truncate file %q: %v", resizeFilename, err)
 	}
 	if _, err := resizeFile.Seek(0, 0); err != nil {
-		panic(err)
+		log.Fatalf("could not seek to beginning of file %q: %v", resizeFilename, err)
 	}
 
-	target, err := whisper.Open(resizeFilename + ".bak")
+	target, err := whisper.Open(backupFilename)
 	if err != nil {
-		panic(err)
+		log.Fatalf("could not open backup file %q as whisper file: %v", backupFilename, err)
 	}
 
 	newRetentions := target.Retentions()
 	if resizeArchiveIndex != -1 {
 		retention, err := whisper.ParseRetentionDef(resizeNewRetention)
 		if err != nil {
-			panic(err)
+			log.Fatalf("could not parse new retention definition %q: %v", resizeNewRetention, err)
 		}
 		newRetentions[resizeArchiveIndex] = retention
 	}
@@ -109,13 +117,13 @@ func modifyCommand(c Command) int {
 		case "sum":
 			aggMethod = whisper.Sum
 		default:
-			panic("unsupported aggregation method")
+			log.Fatalf("unsupported aggregation method %q", resizeAgg)
 		}
 	}
 
 	result, err := whisper.Create2(resizeFile, newRetentions, aggMethod, target.XFF())
 	if err != nil {
-		panic(err)
+		log.Fatalf("could not create whisper structure in %q: %v", resizeFilename, err)
 	}
 
 	if resizeArchiveIndex != -1 {
