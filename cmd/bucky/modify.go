@@ -132,7 +132,17 @@ func modifyCommand(c Command) int {
 		modifyAgg(target, result, aggMethod)
 	}
 
-	result.Close()
+	if err := result.File().Close(); err != nil {
+		log.Fatalf("could not close file %q: %v", resizeFilename, err)
+	}
+
+	if err := target.File().Close(); err != nil {
+		log.Fatalf("could not close backup file %q: %v", backupFilename, err)
+	}
+
+	if err := os.Remove(backupFilename); err != nil {
+		log.Fatalf("could not unlink backup file %q: %v", backupFilename, err)
+	}
 
 	return 0
 }
