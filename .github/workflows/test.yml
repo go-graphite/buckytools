@@ -12,25 +12,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go: [ 1.17.x, 1.18.x, 1.19.x, 1.20.x, tip ]
+        go: [ 1.17.x, 1.18.x, 1.19.x, 1.20.x ]
 
     steps:
     - uses: actions/checkout@v3
 
     - name: Set up Go stable
-      if: matrix.go != 'tip'
       uses: actions/setup-go@v3
       with:
         go-version: ${{ matrix.go }}
-    - name: Set up Go tip
-      if: matrix.go == 'tip'
-      run: |
-        curl -sL https://storage.googleapis.com/go-build-snap/go/linux-amd64/$(git ls-remote https://github.com/golang/go.git HEAD | awk '{print $1;}').tar.gz -o gotip.tar.gz
-        ls -lah gotip.tar.gz
-        mkdir -p ~/sdk/gotip
-        tar -C ~/sdk/gotip -xzf gotip.tar.gz
-        ~/sdk/gotip/bin/go version
-        echo "PATH=$HOME/go/bin:$HOME/sdk/gotip/bin/:$PATH" >> $GITHUB_ENV
 
     - name: Check out code into the Go module directory
       uses: actions/checkout@v3
