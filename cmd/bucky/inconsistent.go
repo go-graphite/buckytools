@@ -34,13 +34,19 @@ Use bucky rebalance to correct.`
 
 	c.Flag.BoolVar(&listForce, "f", false,
 		"Force the remote daemons to rebuild their cache.")
+	c.Flag.BoolVar(&listRegexMode, "r", false,
+		"Filter by a regular expression.")
 }
 
-func InconsistentMetrics(hostports []string) (map[string][]string, error) {
+func InconsistentMetrics(hostports []string, regex string) (map[string][]string, error) {
 	var list map[string][]string
 	var err error
 
-	list, err = ListAllMetrics(hostports, listForce)
+	if regex != "" {
+		list, err = ListRegexMetrics(hostports, regex, listForce)
+	} else {
+		list, err = ListAllMetrics(hostports, listForce)
+	}
 	if err != nil {
 		log.Printf("Error retrieving metric lists: %s", err)
 		return nil, err
@@ -92,7 +98,14 @@ func inconsistentCommand(c Command) int {
 	if !Cluster.Healthy {
 		log.Printf("Warning: Cluster is not healthy!")
 	}
-	results, err := InconsistentMetrics(Cluster.HostPorts())
+
+	var results map[string][]string
+	if listRegexMode && c.Flag.NArg() > 0 {
+		results, err = InconsistentMetrics(Cluster.HostPorts(), c.Flag.Arg(0))
+	} else {
+		results, err = InconsistentMetrics(Cluster.HostPorts(), "")
+	}
+
 	if JSONOutput {
 		blob, err := json.Marshal(results)
 		if err != nil {
