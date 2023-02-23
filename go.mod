@@ -1,17 +1,22 @@
 module github.com/go-graphite/buckytools
 
-go 1.16
+go 1.17
 
 require (
-	github.com/go-graphite/go-whisper v0.0.0-20220406100812-1e1f97814b0e
+	github.com/go-graphite/go-whisper v0.0.0-20230221134257-6774e38a461b
 	github.com/golang-jwt/jwt v3.2.2+incompatible
-	github.com/golang/snappy v0.0.0-20170215233205-553a64147049
-	github.com/google/go-cmp v0.5.5 // indirect
+	github.com/golang/snappy v0.0.4
 	github.com/gorilla/handlers v1.5.1
-	github.com/kisielk/og-rek v0.0.0-20170425174049-dd41cde712de
-	github.com/kr/pretty v0.2.1 // indirect
-	github.com/pborman/uuid v0.0.0-20170612153648-e790cca94e6c
-	github.com/pyroscope-io/client v0.4.0
-	golang.org/x/crypto v0.0.0-20180306223934-85f98707c97e
-	golang.org/x/sys v0.0.0-20180308025116-349b81fb5c64 // indirect
+	github.com/kisielk/og-rek v1.2.0
+	github.com/pborman/uuid v1.2.1
+	github.com/pyroscope-io/client v0.6.0
+	golang.org/x/crypto v0.6.0
+)
+
+require (
+	github.com/felixge/httpsnoop v1.0.3 // indirect
+	github.com/google/uuid v1.3.0 // indirect
+	github.com/pyroscope-io/godeltaprof v0.1.0 // indirect
+	golang.org/x/sys v0.5.0 // indirect
+	golang.org/x/term v0.5.0 // indirect
 )

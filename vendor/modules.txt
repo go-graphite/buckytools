@@ -1,39 +1,48 @@
-# github.com/felixge/httpsnoop v1.0.1
+# github.com/felixge/httpsnoop v1.0.3
+## explicit; go 1.13
 github.com/felixge/httpsnoop
-# github.com/go-graphite/go-whisper v0.0.0-20220406100812-1e1f97814b0e
-## explicit
+# github.com/go-graphite/go-whisper v0.0.0-20230221134257-6774e38a461b
+## explicit; go 1.18
 github.com/go-graphite/go-whisper
 # github.com/golang-jwt/jwt v3.2.2+incompatible
 ## explicit
 github.com/golang-jwt/jwt
-# github.com/golang/snappy v0.0.0-20170215233205-553a64147049
+# github.com/golang/snappy v0.0.4
 ## explicit
 github.com/golang/snappy
-# github.com/google/go-cmp v0.5.5
+# github.com/google/uuid v1.3.0
 ## explicit
+github.com/google/uuid
 # github.com/gorilla/handlers v1.5.1
-## explicit
+## explicit; go 1.14
 github.com/gorilla/handlers
-# github.com/kisielk/og-rek v0.0.0-20170425174049-dd41cde712de
-## explicit
+# github.com/kisielk/og-rek v1.2.0
+## explicit; go 1.12
 github.com/kisielk/og-rek
-# github.com/kr/pretty v0.2.1
-## explicit
-# github.com/pborman/uuid v0.0.0-20170612153648-e790cca94e6c
+# github.com/pborman/uuid v1.2.1
 ## explicit
 github.com/pborman/uuid
-# github.com/pyroscope-io/client v0.4.0
-## explicit
+# github.com/pyroscope-io/client v0.6.0
+## explicit; go 1.17
 github.com/pyroscope-io/client/internal/alignedticker
 github.com/pyroscope-io/client/internal/flameql
 github.com/pyroscope-io/client/internal/sortedmap
 github.com/pyroscope-io/client/pyroscope
 github.com/pyroscope-io/client/upstream
 github.com/pyroscope-io/client/upstream/remote
-# golang.org/x/crypto v0.0.0-20180306223934-85f98707c97e
-## explicit
+# github.com/pyroscope-io/godeltaprof v0.1.0
+## explicit; go 1.16
+github.com/pyroscope-io/godeltaprof
+github.com/pyroscope-io/godeltaprof/internal/pprof
+# golang.org/x/crypto v0.6.0
+## explicit; go 1.17
 golang.org/x/crypto/ssh/terminal
-# golang.org/x/sys v0.0.0-20180308025116-349b81fb5c64
-## explicit
+# golang.org/x/sys v0.5.0
+## explicit; go 1.17
+golang.org/x/sys/internal/unsafeheader
+golang.org/x/sys/plan9
 golang.org/x/sys/unix
 golang.org/x/sys/windows
+# golang.org/x/term v0.5.0
+## explicit; go 1.17
+golang.org/x/term

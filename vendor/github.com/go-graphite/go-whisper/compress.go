@@ -246,6 +246,7 @@ func (whisper *Whisper) readHeaderCompressed() (err error) {
 		offset += IntSize
 
 		arc.stats.discard.oldInterval = uint32(unpackInt(b[offset : offset+IntSize]))
+		whisper.discardedPointsAtOpen += arc.stats.discard.oldInterval
 		offset += IntSize
 		arc.stats.extended = uint32(unpackInt(b[offset : offset+IntSize]))
 		offset += IntSize
@@ -476,23 +477,41 @@ func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points
 	bufferUnitPointsCount := archive.next.secondsPerPoint / archive.secondsPerPoint
 	for aindex := 0; aindex < len(alignedPoints); {
 		dp := alignedPoints[aindex]
-		bpBaseInterval := archive.AggregateInterval(dp.interval)
+		dpBaseInterval := archive.AggregateInterval(dp.interval)
 
 		// NOTE: current implementation expects data points to be monotonically
 		// increasing in time
-		if minInterval != 0 && bpBaseInterval < minInterval {
+		if minInterval != 0 && dpBaseInterval < minInterval { // TODO: check against cblock pn1.interval?
 			archive.stats.discard.oldInterval++
 			aindex++
 			continue
 		}
 
-		// check if buffer is full
-		if baseIntervalsPerUnit[currentUnit] == 0 || baseIntervalsPerUnit[currentUnit] == bpBaseInterval {
+		// Tolerate out of order data handling within the current buffer.
+		targetUnit := -1
+		for i, unitInterval := range baseIntervalsPerUnit {
+			if dpBaseInterval == unitInterval {
+				targetUnit = i
+				break
+			}
+		}
+		if targetUnit != -1 {
 			aindex++
-			baseIntervalsPerUnit[currentUnit] = bpBaseInterval
 
 			// TODO: not efficient if many data points are being written in one call
-			offset := currentUnit*bufferUnitPointsCount + (dp.interval-bpBaseInterval)/archive.secondsPerPoint
+			offset := targetUnit*bufferUnitPointsCount + (dp.interval-dpBaseInterval)/archive.secondsPerPoint
+			copy(archive.buffer[offset*PointSize:], dp.Bytes())
+
+			continue
+		}
+
+		// check if buffer is full
+		if baseIntervalsPerUnit[currentUnit] == 0 || baseIntervalsPerUnit[currentUnit] == dpBaseInterval {
+			aindex++
+			baseIntervalsPerUnit[currentUnit] = dpBaseInterval
+
+			// TODO: not efficient if many data points are being written in one call
+			offset := currentUnit*bufferUnitPointsCount + (dp.interval-dpBaseInterval)/archive.secondsPerPoint
 			copy(archive.buffer[offset*PointSize:], dp.Bytes())
 
 			continue
@@ -578,8 +597,22 @@ func (archive *archiveInfo) getBufferByUnit(unit int) []byte {
 func (archive *archiveInfo) appendToBlockAndRotate(dps []dataPoint) (rotated bool, err error) {
 	whisper := archive.whisper // TODO: optimize away?
 
-	// TODO: to improve?
-	blockBuffer := make([]byte, len(dps)*(MaxCompressedPointSize)+endOfBlockSize)
+	// Why MaxCompressedPointSize+1 and endOfBlockSize*2:
+	//
+	// MaxCompressedPointSize is set to 14, but in reality, a maximum compressed
+	// data point has a bit length of 14.125(113 bits). And there might be times
+	// when the current block is almost full, and more data needs to be set 0. So
+	// here go-whisper should prefer to have a large buffer just to be on the safe
+	// side.
+	//
+	// An edge case that can be fixed by this allocation strategy is that: the
+	// current block has less than 14 bytes plus endOfBlockSize (5) bytes
+	// available, and a data point that can't be well compressed comes in, then the
+	// buffer isn't large enough to fill the generated binary data.
+	//
+	// This allocation strategy makes sure that there is enough space in the block
+	// buffer for compression output.
+	blockBuffer := make([]byte, len(dps)*(MaxCompressedPointSize+1)+endOfBlockSize*2)
 
 	for {
 		offset := archive.cblock.lastByteOffset // lastByteOffset is updated in AppendPointsToBlock
@@ -879,7 +912,7 @@ func (a *archiveInfo) AppendPointsToBlock(buf []byte, ps []dataPoint) (written i
 	for i, p := range ps {
 		if p.interval == 0 {
 			continue
-		} else if p.interval < a.cblock.pn1.interval {
+		} else if p.interval <= a.cblock.pn1.interval {
 			a.stats.discard.oldInterval++
 			continue
 		}
