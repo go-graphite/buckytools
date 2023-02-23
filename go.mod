@@ -1,6 +1,6 @@
 module github.com/go-graphite/buckytools
 
-go 1.20
+go 1.17
 
 require (
 	github.com/go-graphite/go-whisper v0.0.0-20230221134257-6774e38a461b
