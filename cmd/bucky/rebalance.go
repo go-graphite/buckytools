@@ -8,7 +8,8 @@ import (
 )
 
 var rebalanceConfig struct {
-	allowedDsts string
+	allowedDsts        string
+	allowedMetricRegex string
 }
 
 func init() {
@@ -34,6 +35,10 @@ hosts will be affected even with -s.
 Use --delete to delete metric source locations.  The default is to not remove
 the source metrics.
 
+Use -allowed-dsts to copy/rebalance metrics only to the allowed destinations (ip1:port;ip2:port). By default (i.e. empty), all dsts are allowed.
+
+Use -r to copy/rebalance metrics matching regex. By default (i.e. empty), all metrics are allowed.")
+
 The --no-op option will not alter any metrics and print a report of what
 would have been done.
 
@@ -50,6 +55,7 @@ Set -offload=true to speed up rebalance.`
 	msFlags.registerFlags(c.Flag)
 	c.Flag.BoolVar(&listForce, "f", false, "Force the remote daemons to rebuild their cache.")
 	c.Flag.StringVar(&rebalanceConfig.allowedDsts, "allowed-dsts", "", "Only copy/rebalance metrics to the allowed destinations (ip1:port,ip2:port). By default (i.e. empty), all dsts are allowed.")
+	c.Flag.StringVar(&rebalanceConfig.allowedMetricRegex, "r", "", "Only copy/rebalance metrics matching regex. By default (i.e. empty), all metrics are allowed.")
 }
 
 // countMap returns the number of metrics in a server -> metrics mapping
@@ -78,7 +84,7 @@ func RebalanceMetrics(extraHostPorts []string) error {
 		return fmt.Errorf("cluster is unhealthy")
 	}
 
-	metricMap, err := InconsistentMetrics(hostPorts)
+	metricMap, err := InconsistentMetrics(hostPorts, rebalanceConfig.allowedMetricRegex)
 	if err != nil {
 		return err // error already reported
 	}
