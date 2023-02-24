@@ -76,10 +76,9 @@ func (bf2 *backfill2Command) do(c Command) int {
 			log.Printf("Can't get list of metrics to copy.")
 			return 1
 		}
-		log.Printf("Number of metrics to copy: %d", len(metricMap))
+
 		// make jobs struct in the similar way as rebalance does
 		// but we have our src and dst cluster explicitly
-		moves := make(map[string]int)
 		servers := make([]string, 0)
 		for src, metrics := range metricMap {
 			servers = append(servers, src)
@@ -91,8 +90,6 @@ func (bf2 *backfill2Command) do(c Command) int {
 				job.OldName = m
 				job.NewName = m
 
-				moves[src]++
-
 				if _, ok := jobs[dst]; !ok {
 					jobs[dst] = map[string][]*syncJob{}
 				}
@@ -102,6 +99,7 @@ func (bf2 *backfill2Command) do(c Command) int {
 					log.Printf("[%s] %s => %s", src, m, dst)
 				}
 			}
+			log.Printf("Number of metrics to copy: %d", bf2.metricSyncer.countJobs(jobs))
 		}
 	} else {
 		metricsMap := map[string]string{}
