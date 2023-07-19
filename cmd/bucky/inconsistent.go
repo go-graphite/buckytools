@@ -35,6 +35,10 @@ Use bucky rebalance to correct.`
 		"Force the remote daemons to rebuild their cache.")
 	c.Flag.BoolVar(&listRegexMode, "r", false,
 		"Filter by a regular expression.")
+	c.Flag.BoolVar(&listCacheMetrics, "list-cache-metrics", true,
+		"Filter carbon cache metrics.")
+	c.Flag.StringVar(&listCacheMetricsPrefix, "cache-metric-prefix", "carbon.agents.",
+		"cache metric prefix")
 }
 
 func InconsistentMetrics(hostports []string, regex string) (map[string][]string, error) {
@@ -62,6 +66,9 @@ func InconsistentMetrics(hostports []string, regex string) (map[string][]string,
 		}
 
 		for _, m := range metrics {
+			if !listCacheMetrics && strings.HasPrefix(m, listCacheMetricsPrefix) {
+				continue
+			}
 			if Cluster.Hash.GetNode(m).Server != host {
 				results[server] = append(results[server], m)
 			}
