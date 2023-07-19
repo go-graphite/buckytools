@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -63,11 +62,6 @@ func InconsistentMetrics(hostports []string, regex string) (map[string][]string,
 		}
 
 		for _, m := range metrics {
-			if strings.HasPrefix(m, "carbon.agents.") {
-				// These metrics are inserted into the stream after hashing
-				// is done.  They will never be consistent and shouldn't be.
-				continue
-			}
 			if Cluster.Hash.GetNode(m).Server != host {
 				results[server] = append(results[server], m)
 			}
