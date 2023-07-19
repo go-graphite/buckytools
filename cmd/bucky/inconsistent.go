@@ -7,10 +7,14 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
 // import "github.com/go-graphite/buckytools/hashing"
+
+var inconsistentCacheMetrics bool
+var inconsistentCacheMetricsPrefix string
 
 func init() {
 	usage := "[options]"
@@ -35,9 +39,9 @@ Use bucky rebalance to correct.`
 		"Force the remote daemons to rebuild their cache.")
 	c.Flag.BoolVar(&listRegexMode, "r", false,
 		"Filter by a regular expression.")
-	c.Flag.BoolVar(&listCacheMetrics, "list-cache-metrics", true,
+	c.Flag.BoolVar(&inconsistentCacheMetrics, "list-cache-metrics", true,
 		"Filter carbon cache metrics.")
-	c.Flag.StringVar(&listCacheMetricsPrefix, "cache-metric-prefix", "carbon.agents.",
+	c.Flag.StringVar(&inconsistentCacheMetricsPrefix, "cache-metric-prefix", "carbon.agents.",
 		"cache metric prefix")
 }
 
@@ -66,7 +70,7 @@ func InconsistentMetrics(hostports []string, regex string) (map[string][]string,
 		}
 
 		for _, m := range metrics {
-			if !listCacheMetrics && strings.HasPrefix(m, listCacheMetricsPrefix) {
+			if !inconsistentCacheMetrics && strings.HasPrefix(m, inconsistentCacheMetricsPrefix) {
 				continue
 			}
 			if Cluster.Hash.GetNode(m).Server != host {
