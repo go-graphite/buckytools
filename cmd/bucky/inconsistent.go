@@ -13,8 +13,8 @@ import (
 
 // import "github.com/go-graphite/buckytools/hashing"
 
-var inconsistentCacheMetrics bool
-var inconsistentCacheMetricsPrefix string
+var inconsistentInconsistentCacheMetrics bool
+var inconsistentGoCarbonMetricsPrefix string
 
 func init() {
 	usage := "[options]"
@@ -39,10 +39,8 @@ Use bucky rebalance to correct.`
 		"Force the remote daemons to rebuild their cache.")
 	c.Flag.BoolVar(&listRegexMode, "r", false,
 		"Filter by a regular expression.")
-	c.Flag.BoolVar(&inconsistentCacheMetrics, "list-cache-metrics", true,
-		"Filter carbon cache metrics.")
-	c.Flag.StringVar(&inconsistentCacheMetricsPrefix, "cache-metric-prefix", "carbon.agents.",
-		"cache metric prefix")
+	c.Flag.BoolVar(&inconsistentInconsistentCacheMetrics, "inconsistent-cache-metrics", false, "Search for go-carbon inconsistent metrics.")
+	c.Flag.StringVar(&inconsistentGoCarbonMetricsPrefix, "go-carbon-prefix", "carbon.agents.", "go-carbon metric prefix")
 }
 
 func InconsistentMetrics(hostports []string, regex string) (map[string][]string, error) {
@@ -70,7 +68,7 @@ func InconsistentMetrics(hostports []string, regex string) (map[string][]string,
 		}
 
 		for _, m := range metrics {
-			if !inconsistentCacheMetrics && strings.HasPrefix(m, inconsistentCacheMetricsPrefix) {
+			if !inconsistentInconsistentCacheMetrics && strings.HasPrefix(m, inconsistentGoCarbonMetricsPrefix) {
 				continue
 			}
 			if Cluster.Hash.GetNode(m).Server != host {
