@@ -13,7 +13,7 @@ import (
 
 // import "github.com/go-graphite/buckytools/hashing"
 
-var inconsistentInconsistentCacheMetrics bool
+var inconsistentFilterCacheMetrics bool
 var inconsistentGoCarbonMetricsPrefix string
 
 func init() {
@@ -39,7 +39,7 @@ Use bucky rebalance to correct.`
 		"Force the remote daemons to rebuild their cache.")
 	c.Flag.BoolVar(&listRegexMode, "r", false,
 		"Filter by a regular expression.")
-	c.Flag.BoolVar(&inconsistentInconsistentCacheMetrics, "inconsistent-cache-metrics", false, "Search for go-carbon inconsistent metrics.")
+	c.Flag.BoolVar(&inconsistentFilterCacheMetrics, "filter-cache-metrics", true, "Filter go-carbon inconsistent metrics.")
 	c.Flag.StringVar(&inconsistentGoCarbonMetricsPrefix, "go-carbon-prefix", "carbon.agents.", "go-carbon metric prefix")
 }
 
@@ -68,7 +68,9 @@ func InconsistentMetrics(hostports []string, regex string) (map[string][]string,
 		}
 
 		for _, m := range metrics {
-			if !inconsistentInconsistentCacheMetrics && strings.HasPrefix(m, inconsistentGoCarbonMetricsPrefix) {
+			if inconsistentFilterCacheMetrics && strings.HasPrefix(m, inconsistentGoCarbonMetricsPrefix) {
+				// Graphite cache metrics (usually "carbon.agents.*" metrics) can be inserted into the stream
+				// after hashing has been completed (if written locally). In this case, they will never be consistent and shouldn't be.
 				continue
 			}
 			if Cluster.Hash.GetNode(m).Server != host {

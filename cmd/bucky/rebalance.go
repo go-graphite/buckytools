@@ -56,7 +56,7 @@ Set -offload=true to speed up rebalance.`
 	c.Flag.BoolVar(&listForce, "f", false, "Force the remote daemons to rebuild their cache.")
 	c.Flag.StringVar(&rebalanceConfig.allowedDsts, "allowed-dsts", "", "Only copy/rebalance metrics to the allowed destinations (ip1:port,ip2:port). By default (i.e. empty), all dsts are allowed.")
 	c.Flag.StringVar(&rebalanceConfig.allowedMetricRegex, "r", "", "Only copy/rebalance metrics matching regex. By default (i.e. empty), all metrics are allowed.")
-	c.Flag.BoolVar(&inconsistentInconsistentCacheMetrics, "inconsistent-cache-metrics", false, "Search for go-carbon inconsistent metrics.")
+	c.Flag.BoolVar(&inconsistentFilterCacheMetrics, "filter-cache-metrics", true, "Filter go-carbon inconsistent metrics.")
 	c.Flag.StringVar(&inconsistentGoCarbonMetricsPrefix, "go-carbon-prefix", "carbon.agents.", "go-carbon metric prefix")
 }
 
