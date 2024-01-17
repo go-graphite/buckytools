@@ -17,7 +17,7 @@ import (
 	"github.com/go-graphite/buckytools/hashing"
 	"github.com/go-graphite/buckytools/metrics"
 	"github.com/gorilla/handlers"
-	"github.com/pyroscope-io/client/pyroscope"
+	"github.com/grafana/pyroscope-go"
 )
 
 var metricsCache *metrics.MetricsCacheType
