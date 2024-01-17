@@ -10,13 +10,13 @@ require (
 	github.com/grafana/pyroscope-go v1.0.4
 	github.com/kisielk/og-rek v1.2.0
 	github.com/pborman/uuid v1.2.1
-	golang.org/x/crypto v0.6.0
+	golang.org/x/crypto v0.17.0
 )
 
 require (
 	github.com/felixge/httpsnoop v1.0.3 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.4 // indirect
-	golang.org/x/sys v0.5.0 // indirect
-	golang.org/x/term v0.5.0 // indirect
+	golang.org/x/sys v0.15.0 // indirect
+	golang.org/x/term v0.15.0 // indirect
 )
