@@ -2,16 +2,21 @@ package pyroscope
 
 import (
 	"bytes"
-	"github.com/pyroscope-io/client/internal/alignedticker"
-	"github.com/pyroscope-io/godeltaprof"
+	crand "crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"hash/fnv"
+	"math/rand"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
 	"sync"
 	"time"
 
-	"github.com/pyroscope-io/client/internal/flameql"
-	"github.com/pyroscope-io/client/upstream"
+	"github.com/grafana/pyroscope-go/godeltaprof"
+	"github.com/grafana/pyroscope-go/internal/flameql"
+	"github.com/grafana/pyroscope-go/upstream"
 )
 
 var (
@@ -113,7 +118,7 @@ type flush struct {
 }
 
 func NewSession(c SessionConfig) (*Session, error) {
-	appName, err := mergeTagsWithAppName(c.AppName, c.Tags)
+	appName, err := mergeTagsWithAppName(c.AppName, newSessionID(), c.Tags)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +157,7 @@ func NewSession(c SessionConfig) (*Session, error) {
 //
 // App name may be an empty string. Tags must not contain reserved keys,
 // the map is modified in place.
-func mergeTagsWithAppName(appName string, tags map[string]string) (string, error) {
+func mergeTagsWithAppName(appName string, sid sessionID, tags map[string]string) (string, error) {
 	k, err := flameql.ParseKey(appName)
 	if err != nil {
 		return "", err
@@ -166,6 +171,7 @@ func mergeTagsWithAppName(appName string, tags map[string]string) (string, error
 		}
 		k.Add(tagKey, tagValue)
 	}
+	k.Add(sessionIDLabelName, sid.String())
 	return k.Normalized(), nil
 }
 
@@ -175,7 +181,7 @@ func (ps *Session) takeSnapshots() {
 	if ps.DisableAutomaticResets {
 		automaticResetTicker = make(chan time.Time)
 	} else {
-		t := alignedticker.NewAlignedTicker(ps.uploadRate)
+		t := time.NewTicker(ps.uploadRate)
 		automaticResetTicker = t.C
 		defer t.Stop()
 	}
@@ -200,7 +206,7 @@ func copyBuf(b []byte) []byte {
 	return r
 }
 
-func (ps *Session) start() error {
+func (ps *Session) Start() error {
 	t := ps.truncatedTime()
 	ps.reset(t, t)
 
@@ -254,7 +260,6 @@ func (ps *Session) isGoroutinesEnabled() bool {
 }
 
 func (ps *Session) reset(startTime, endTime time.Time) {
-
 	ps.logger.Debugf("profiling session reset %s", startTime.String())
 
 	// first reset should not result in an upload
@@ -404,7 +409,6 @@ func (ps *Session) dumpBlockProfile(startTime time.Time, endTime time.Time) {
 	ps.upstream.Upload(job)
 }
 
-
 func (ps *Session) Stop() {
 	ps.trieMutex.Lock()
 	defer ps.trieMutex.Unlock()
@@ -454,4 +458,57 @@ func numGC() uint32 {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 	return memStats.NumGC
+}
+
+const sessionIDLabelName = "__session_id__"
+
+type sessionID uint64
+
+func (s sessionID) String() string {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(s))
+	return hex.EncodeToString(b[:])
+}
+
+func newSessionID() sessionID { return globalSessionIDGenerator.newSessionID() }
+
+var globalSessionIDGenerator = newSessionIDGenerator()
+
+type sessionIDGenerator struct {
+	sync.Mutex
+	src *rand.Rand
+}
+
+func (gen *sessionIDGenerator) newSessionID() sessionID {
+	var b [8]byte
+	gen.Lock()
+	_, _ = gen.src.Read(b[:])
+	gen.Unlock()
+	return sessionID(binary.LittleEndian.Uint64(b[:]))
+}
+
+func newSessionIDGenerator() *sessionIDGenerator {
+	s, ok := sessionIDHostSeed()
+	if !ok {
+		s = sessionIDRandSeed()
+	}
+	return &sessionIDGenerator{src: rand.New(rand.NewSource(s))}
+}
+
+func sessionIDRandSeed() int64 {
+	var rndSeed int64
+	_ = binary.Read(crand.Reader, binary.LittleEndian, &rndSeed)
+	return rndSeed
+}
+
+var hostname = os.Hostname
+
+func sessionIDHostSeed() (int64, bool) {
+	v, err := hostname()
+	if err != nil {
+		return 0, false
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(v))
+	return int64(h.Sum64()), true
 }
