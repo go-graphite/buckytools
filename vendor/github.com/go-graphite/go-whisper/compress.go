@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/bits"
 	"os"
@@ -452,25 +451,71 @@ func (whisper *Whisper) fetchCompressed(start, end int64, archive *archiveInfo) 
 	return dst, nil
 }
 
+// splitOutOfOrder separates out the points that the block encoder cannot
+// accept: those whose interval is not strictly newer than the current block
+// watermark (cblock.pn1). Compressed blocks are delta-of-delta encoded and
+// addressable only per block, so such points can never be written in place.
+//
+// Points with a zero interval stay in kept and are skipped by the encoder, as
+// before. Rejected points are counted in stats.discard.oldInterval whether or
+// not the caller goes on to divert them to the out-of-order sidecar, so that
+// counter keeps its existing meaning: rejected by the compressed encoder.
+//
+// The watermark advances as points are accepted, mirroring what the encoder
+// itself does, so kept comes back strictly ascending whatever order it was given
+// and AppendPointsToBlock's own check never has to fire. That keeps
+// stats.discard.oldInterval and the diverted count in agreement.
+//
+// kept aliases the caller's backing array and is compacted in place; every
+// caller passes a freshly built slice.
+func (archive *archiveInfo) splitOutOfOrder(dps []dataPoint) (kept, dropped []dataPoint) {
+	watermark := archive.cblock.pn1.interval
+
+	n := 0
+	for _, p := range dps {
+		if p.interval != 0 && p.interval <= watermark {
+			archive.stats.discard.oldInterval++
+			dropped = append(dropped, p)
+			continue
+		}
+		if p.interval > watermark {
+			watermark = p.interval
+		}
+		dps[n] = p
+		n++
+	}
+
+	return dps[:n], dropped
+}
+
 // NOTE: this method assumes data saved in higer archives are fixed. If
 // we mvoe to allowing data/intervals coming in non-monotonic order, we
 // need to rethink the implementation here as well.
-func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points []*TimeSeriesPoint) error {
+//
+// Points rejected because they are not newer than what is already written are
+// returned as dropped, so the caller can divert them to the out-of-order
+// sidecar (see ooo.go). Without Options.OutOfOrder the caller ignores them,
+// which is the historical behaviour.
+func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points []*TimeSeriesPoint) (dropped []oooPoint, err error) {
 	alignedPoints := alignPoints(archive, points)
 
 	// Note: in the current design, mix aggregation doesn't have any buffer in
 	// higer archives
 	if !archive.hasBuffer() {
+		var rejected []dataPoint
+		alignedPoints, rejected = archive.splitOutOfOrder(alignedPoints)
+		dropped = whisper.appendOOO(dropped, archive, rejected)
+
 		rotated, err := archive.appendToBlockAndRotate(alignedPoints)
 		if err != nil {
-			return err
+			return dropped, err
 		}
 
 		if !(whisper.aggregationMethod == Mix && rotated) {
-			return nil
+			return dropped, nil
 		}
 
-		return whisper.propagateToMixedArchivesCompressed()
+		return dropped, whisper.propagateToMixedArchivesCompressed()
 	}
 
 	baseIntervalsPerUnit, currentUnit, minInterval := archive.getBufferInfo()
@@ -483,6 +528,7 @@ func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points
 		// increasing in time
 		if minInterval != 0 && dpBaseInterval < minInterval { // TODO: check against cblock pn1.interval?
 			archive.stats.discard.oldInterval++
+			dropped = whisper.appendOOO(dropped, archive, []dataPoint{dp})
 			aindex++
 			continue
 		}
@@ -529,13 +575,18 @@ func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points
 			buffer[i] = 0
 		}
 
+		dps, flushRejected := archive.splitOutOfOrder(dps)
+		dropped = whisper.appendOOO(dropped, archive, flushRejected)
+
+		// nothing left to write or propagate: the unit was empty, or every
+		// point in it was older than the block watermark and got diverted
 		if len(dps) <= 0 {
 			continue
 		}
 
 		if _, err := archive.appendToBlockAndRotate(dps); err != nil {
 			// TODO: record and continue?
-			return err
+			return dropped, err
 		}
 
 		// propagate
@@ -554,13 +605,15 @@ func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points
 			point := &TimeSeriesPoint{lowerIntervalStart, aggregateValue}
 
 			// TODO: consider migrating to a non-recursive propagation implementation like mix policy
-			if err := whisper.archiveUpdateManyCompressed(lower, []*TimeSeriesPoint{point}); err != nil {
-				return err
+			lowerDropped, err := whisper.archiveUpdateManyCompressed(lower, []*TimeSeriesPoint{point})
+			dropped = append(dropped, lowerDropped...)
+			if err != nil {
+				return dropped, err
 			}
 		}
 	}
 
-	return nil
+	return dropped, nil
 }
 
 func (archive *archiveInfo) getBufferInfo() (units []int, index, min int) {
@@ -656,12 +709,27 @@ func (archive *archiveInfo) appendToBlockAndRotate(dps []dataPoint) (rotated boo
 }
 
 func (whisper *Whisper) extendIfNeeded() error {
-	var rets []*Retention
-	var mixSpecs []MixAggregationSpec
-	var mixSizes = make(map[int][]float32)
-	var extend bool
-	var msg string
-	var nferrs []error
+	rets, extend, msg := whisper.computeExtendedRetentions()
+	if !extend {
+		return nil
+	}
+
+	if debugExtend {
+		fmt.Println("extend:", whisper.file.Name(), msg)
+	}
+
+	if err := whisper.rewrite(rets, "extend", nil); err != nil {
+		return err
+	}
+	whisper.Extended = true
+
+	return nil
+}
+
+// computeExtendedRetentions reports the retentions the file should be rewritten
+// with, and whether any archive has outgrown its estimated compressed point
+// size and therefore needs the rewrite at all.
+func (whisper *Whisper) computeExtendedRetentions() (rets []*Retention, extend bool, msg string) {
 	for _, arc := range whisper.archives {
 		ret := &Retention{
 			secondsPerPoint:        arc.secondsPerPoint,
@@ -698,16 +766,27 @@ func (whisper *Whisper) extendIfNeeded() error {
 		rets = append(rets, ret)
 	}
 
-	if !extend {
-		return nil
-	}
+	return rets, extend, msg
+}
 
-	if debugExtend {
-		fmt.Println("extend:", whisper.file.Name(), msg)
-	}
+// rewrite rebuilds the whole compressed file under the given retentions by
+// decompressing every block and re-encoding it into a sibling temp file, which
+// is then renamed into place. op names the operation and its temp suffix
+// ("extend", "compact").
+//
+// extra optionally supplies additional points to merge into archive i as it is
+// rewritten. They must be sorted ascending by interval. Where an interval is
+// already present in the file, the file's value wins unless the extra point is
+// marked replace. This is how the out-of-order sidecar is folded back in; pass
+// nil for a plain rewrite.
+func (whisper *Whisper) rewrite(rets []*Retention, op string, extra func(archiveIndex int) []extraPoint) error {
+	var mixSpecs []MixAggregationSpec
+	var mixSizes = make(map[int][]float32)
+	var nferrs []error
 
 	filename := whisper.file.Name()
-	if err := os.Remove(whisper.file.Name() + ".extend"); err != nil && !os.IsNotExist(err) {
+	tmpname := filename + "." + op
+	if err := os.Remove(tmpname); err != nil && !os.IsNotExist(err) {
 		nferrs = append(nferrs, err)
 	}
 
@@ -716,7 +795,7 @@ func (whisper *Whisper) extendIfNeeded() error {
 	}
 
 	nwhisper, err := CreateWithOptions(
-		whisper.file.Name()+".extend", rets,
+		tmpname, rets,
 		whisper.aggregationMethod, whisper.xFilesFactor,
 		&Options{
 			Compressed:                 true,
@@ -727,7 +806,7 @@ func (whisper *Whisper) extendIfNeeded() error {
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("extend: %s", err)
+		return fmt.Errorf("%s: %s", op, err)
 	}
 
 	for i := len(whisper.archives) - 1; i >= 0; i-- {
@@ -735,6 +814,14 @@ func (whisper *Whisper) extendIfNeeded() error {
 		copy(nwhisper.archives[i].buffer, archive.buffer)
 		nwhisper.archives[i].stats = archive.stats
 
+		var pending []extraPoint
+		if extra != nil {
+			pending = extra(i)
+		}
+
+		// Blocks come back ascending by start and each block's points are
+		// ascending, so the whole stream is ascending and pending can be drained
+		// against it in order. appendToBlockAndRotate requires that.
 		for _, block := range archive.getSortedBlockRanges() {
 			buf := make([]byte, archive.blockSize)
 			if err := whisper.fileReadAt(buf, int64(archive.blockOffset(block.index))); err != nil {
@@ -744,15 +831,31 @@ func (whisper *Whisper) extendIfNeeded() error {
 			if err != nil {
 				return fmt.Errorf("archives[%d].blocks[%d].read: %s", i, block.index, err)
 			}
+
+			var before []extraPoint
+			before, pending = splitBefore(pending, block.start)
+			if len(before) > 0 {
+				if _, err := nwhisper.archives[i].appendToBlockAndRotate(dataPointsOf(before)); err != nil {
+					return fmt.Errorf("archives[%d].extra.write: %s", i, err)
+				}
+			}
+			dst, pending = mergeExtra(dst, pending, block.end)
+
 			if _, err := nwhisper.archives[i].appendToBlockAndRotate(dst); err != nil {
 				return fmt.Errorf("archives[%d].blocks[%d].write: %s", i, block.index, err)
+			}
+		}
+
+		if len(pending) > 0 {
+			if _, err := nwhisper.archives[i].appendToBlockAndRotate(dataPointsOf(pending)); err != nil {
+				return fmt.Errorf("archives[%d].extra.write: %s", i, err)
 			}
 		}
 
 		nwhisper.archives[i].buffer = archive.buffer
 	}
 	if err := nwhisper.WriteHeaderCompressed(); err != nil {
-		return fmt.Errorf("extend: failed to writer header: %s", err)
+		return fmt.Errorf("%s: failed to write header: %w", op, err)
 	}
 
 	if err := whisper.Close(); err != nil {
@@ -764,17 +867,97 @@ func (whisper *Whisper) extendIfNeeded() error {
 
 	if whisper.opts.InMemory {
 		whisper.file.(*memFile).data = nwhisper.file.(*memFile).data
-		releaseMemFile(filename + ".extend")
-	} else if err = os.Rename(filename+".extend", filename); err != nil {
-		return fmt.Errorf("extend/rename: %s", err)
+		releaseMemFile(tmpname)
+	} else if err = os.Rename(tmpname, filename); err != nil {
+		return fmt.Errorf("%s/rename: %s", op, err)
 	}
 
+	// whisper.Close() above released the cached sidecar handle, and the copy
+	// below replaces every field. OpenWithOptions re-derives oooPath via
+	// detectOOO, so only what a stat cannot tell us has to be carried over.
+	oooPoints, oooBroken := whisper.OutOfOrderPoints, whisper.oooBroken
+
 	nwhisper, err = OpenWithOptions(filename, whisper.opts)
+	if err != nil {
+		return fmt.Errorf("%s/reopen: %w", op, err)
+	}
 	*whisper = *nwhisper
-	whisper.Extended = true
+	whisper.OutOfOrderPoints, whisper.oooBroken = oooPoints, oooBroken
+	if oooBroken {
+		whisper.oooPath = ""
+	}
 	whisper.NonFatalErrors = append(whisper.NonFatalErrors, nferrs...)
 
 	return err
+}
+
+// splitBefore peels off the leading run of points strictly older than interval.
+// A zero interval marks an empty block and matches nothing.
+func splitBefore(points []extraPoint, interval int) (before, rest []extraPoint) {
+	if interval <= 0 {
+		return nil, points
+	}
+
+	n := 0
+	for n < len(points) && points[n].interval < interval {
+		n++
+	}
+
+	return points[:n], points[n:]
+}
+
+// dataPointsOf strips the merge flag, for the encoder.
+func dataPointsOf(ps []extraPoint) []dataPoint {
+	dps := make([]dataPoint, len(ps))
+	for i, p := range ps {
+		dps[i] = p.dataPoint
+	}
+
+	return dps
+}
+
+// mergeExtra merges the leading run of extra points at or before end into the
+// ascending block points. Where both hold the same interval the block's value
+// wins - the compressed file stays authoritative - unless the extra point is
+// marked replace, which recomputed aggregates are (see recomputeAggregates).
+func mergeExtra(block []dataPoint, extra []extraPoint, end int) (merged []dataPoint, rest []extraPoint) {
+	if end <= 0 {
+		return block, extra
+	}
+
+	n := 0
+	for n < len(extra) && extra[n].interval <= end {
+		n++
+	}
+	head, rest := extra[:n], extra[n:]
+	if len(head) == 0 {
+		return block, rest
+	}
+
+	merged = make([]dataPoint, 0, len(block)+len(head))
+	i, j := 0, 0
+	for i < len(block) && j < len(head) {
+		switch {
+		case block[i].interval < head[j].interval:
+			merged = append(merged, block[i])
+			i++
+		case block[i].interval > head[j].interval:
+			merged = append(merged, head[j].dataPoint)
+			j++
+		case head[j].replace:
+			merged = append(merged, head[j].dataPoint)
+			i++
+			j++
+		default:
+			merged = append(merged, block[i])
+			i++
+			j++
+		}
+	}
+	merged = append(merged, block[i:]...)
+	merged = append(merged, dataPointsOf(head[j:])...)
+
+	return merged, rest
 }
 
 func extractMixSpecs(orets Retentions, arcs []*archiveInfo) (Retentions, []MixAggregationSpec, map[int][]float32) {
@@ -1643,7 +1826,7 @@ func (mf *memFile) Truncate(size int64) error {
 	return nil
 }
 
-func (mf *memFile) dumpOnDisk(fpath string) error { return ioutil.WriteFile(fpath, mf.data, 0644) }
+func (mf *memFile) dumpOnDisk(fpath string) error { return os.WriteFile(fpath, mf.data, 0644) }
 
 // FillCompressed backfill cwhisper files from srcw.
 // The old and new whisper should have the same retention policies.

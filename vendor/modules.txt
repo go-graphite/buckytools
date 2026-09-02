@@ -1,7 +1,7 @@
 # github.com/felixge/httpsnoop v1.0.3
 ## explicit; go 1.13
 github.com/felixge/httpsnoop
-# github.com/go-graphite/go-whisper v0.0.0-20230221134257-6774e38a461b
+# github.com/go-graphite/go-whisper v0.0.0-20260902151236-ae9d64118114
 ## explicit; go 1.18
 github.com/go-graphite/go-whisper
 # github.com/golang-jwt/jwt v3.2.2+incompatible

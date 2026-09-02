@@ -212,6 +212,15 @@ func deleteMetric(w http.ResponseWriter, path string, fatal bool) error {
 			return err
 		}
 	}
+	// A sidecar holds only points the compressed file rejected, so it must go
+	// with the metric.  It also has to go before the sweep below, or it keeps
+	// the metric's directory non-empty forever.
+	if _, err := whisper.RemoveOutOfOrderSidecar(path); err != nil {
+		log.Printf("Error deleting out-of-order sidecar for %s: %s", path, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return err
+	}
+
 	// removing an empty dirs left after a metric removal
 	// it will keep iterating thru a dirs till it get an error or reach the Prefix
 	// Normally the error should be "directory not empty"
@@ -541,12 +550,52 @@ func getMetricData(noEncoding bool, server, name string) (*MetricData, error) {
 	return data, nil
 }
 
+// mergeOutOfOrder folds the out-of-order sidecar of the compressed whisper file
+// at path back into the file itself.  It is a no-op when there is no sidecar,
+// which is the common case and costs a single stat.
+//
+// Merging is a full file rewrite, so it happens only when a sidecar is actually
+// present.
+func mergeOutOfOrder(path string) error {
+	if _, err := os.Stat(whisper.OutOfOrderSidecarPath(path)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	wsp, err := whisper.OpenWithOptions(path, &whisper.Options{FLock: true})
+	if err != nil {
+		return err
+	}
+	defer wsp.Close()
+
+	if !wsp.IsCompressed() {
+		// Only the compressed format has sidecars; whatever this file is, it
+		// is not one of ours.
+		return nil
+	}
+
+	return wsp.MergeOutOfOrder()
+}
+
 // serveMetric will serve a GET request for the metric that path
 // refers to.  Effort is made to serve file data that is pristine and
 // not in the middle of an update by carbon-cache.  The parameter metric is
 // the dotted notation of the metric name.
 func serveMetric(w http.ResponseWriter, r *http.Request, path, metric string) {
 	var content io.ReadSeeker
+
+	// We serve the file's raw bytes, which do not include points diverted to
+	// an out-of-order sidecar.  Fold it in first so the receiver gets all of
+	// them -- and so stat below reports the merged size, which the client
+	// checks the transferred body against.
+	if err := mergeOutOfOrder(path); err != nil {
+		log.Printf("Error merging out-of-order sidecar for %s: %s", path, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	stat, err := statMetric(metric, path)
 	if err != nil {
 		if os.IsNotExist(err) {

@@ -1,9 +1,9 @@
 module github.com/go-graphite/buckytools
 
-go 1.17
+go 1.18
 
 require (
-	github.com/go-graphite/go-whisper v0.0.0-20230221134257-6774e38a461b
+	github.com/go-graphite/go-whisper v0.0.0-20260902151236-ae9d64118114
 	github.com/golang-jwt/jwt v3.2.2+incompatible
 	github.com/golang/snappy v0.0.4
 	github.com/gorilla/handlers v1.5.1
