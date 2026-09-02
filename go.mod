@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/go-graphite/go-whisper v0.0.0-20260902151236-ae9d64118114
-	github.com/golang-jwt/jwt v3.2.2+incompatible
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/golang/snappy v0.0.4
 	github.com/gorilla/handlers v1.5.1
 	github.com/grafana/pyroscope-go v1.4.2
