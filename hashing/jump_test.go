@@ -131,7 +131,7 @@ func TestOutOfRange(t *testing.T) {
 
 func TestJumpCHR(t *testing.T) {
 	chr := makeJumpTestCHR(1)
-	t.Logf(chr.String())
+	t.Log(chr.String())
 
 	data := map[string]string{
 		"foobar": "graphite-data043-g5",
@@ -150,7 +150,7 @@ func TestJumpCHR(t *testing.T) {
 
 func TestJumpCHRInstanceOrder(t *testing.T) {
 	chr := makeJumpTestCHRWithInstanceName(1)
-	t.Logf(chr.String())
+	t.Log(chr.String())
 	//Order the slice of nodes by instance name
 	oNodes := make(nodesSlice, len(jumpHashTestNodesWithInstanceName))
 	copy(oNodes, jumpHashTestNodesWithInstanceName)

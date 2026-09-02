@@ -2,12 +2,7 @@ package pyroscope
 
 import (
 	"bytes"
-	crand "crypto/rand"
-	"encoding/binary"
-	"encoding/hex"
-	"hash/fnv"
-	"math/rand"
-	"os"
+	"math"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
@@ -15,101 +10,61 @@ import (
 	"time"
 
 	"github.com/grafana/pyroscope-go/godeltaprof"
-	"github.com/grafana/pyroscope-go/internal/flameql"
+	"github.com/grafana/pyroscope-go/internal/semconv"
 	"github.com/grafana/pyroscope-go/upstream"
-)
-
-var (
-	sampleTypeConfigHeap = map[string]*upstream.SampleType{
-		"alloc_objects": {
-			Units:      "objects",
-			Cumulative: false,
-		},
-		"alloc_space": {
-			Units:      "bytes",
-			Cumulative: false,
-		},
-		"inuse_space": {
-			Units:       "bytes",
-			Aggregation: "average",
-			Cumulative:  false,
-		},
-		"inuse_objects": {
-			Units:       "objects",
-			Aggregation: "average",
-			Cumulative:  false,
-		},
-	}
-	sampleTypeConfigMutex = map[string]*upstream.SampleType{
-		"contentions": {
-			DisplayName: "mutex_count",
-			Units:       "lock_samples",
-			Cumulative:  false,
-		},
-		"delay": {
-			DisplayName: "mutex_duration",
-			Units:       "lock_nanoseconds",
-			Cumulative:  false,
-		},
-	}
-	sampleTypeConfigBlock = map[string]*upstream.SampleType{
-		"contentions": {
-			DisplayName: "block_count",
-			Units:       "lock_samples",
-			Cumulative:  false,
-		},
-		"delay": {
-			DisplayName: "block_duration",
-			Units:       "lock_nanoseconds",
-			Cumulative:  false,
-		},
-	}
 )
 
 type Session struct {
 	// configuration, doesn't change
-	upstream               upstream.Upstream
-	sampleRate             uint32
-	profileTypes           []ProfileType
-	uploadRate             time.Duration
-	disableGCRuns          bool
+	upstream      upstream.Upstream
+	profileTypes  []ProfileType
+	uploadRate    time.Duration
+	disableGCRuns bool
+	// Deprecated: the field will be removed in future releases.
 	DisableAutomaticResets bool
 
-	logger    Logger
-	stopOnce  sync.Once
-	stopCh    chan struct{}
-	flushCh   chan *flush
-	trieMutex sync.Mutex
+	logger   Logger
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+	flushCh  chan *flush
 
 	// these things do change:
-	cpuBuf *bytes.Buffer
 	memBuf *bytes.Buffer
 
-	goroutinesBuf *bytes.Buffer
-	mutexBuf      *bytes.Buffer
-	blockBuf      *bytes.Buffer
+	goroutinesBuf    *bytes.Buffer
+	goroutineLeakBuf *bytes.Buffer
+	mutexBuf         *bytes.Buffer
+	blockBuf         *bytes.Buffer
 
 	lastGCGeneration uint32
-	appName          string
+	appNames         semconv.AppNames
 	startTime        time.Time
 
 	deltaBlock *godeltaprof.BlockProfiler
 	deltaMutex *godeltaprof.BlockProfiler
 	deltaHeap  *godeltaprof.HeapProfiler
+	cpu        *cpuProfileCollector
 }
 
 type SessionConfig struct {
-	Upstream               upstream.Upstream
-	Logger                 Logger
-	AppName                string
-	Tags                   map[string]string
-	ProfilingTypes         []ProfileType
-	DisableGCRuns          bool
+	Upstream       upstream.Upstream
+	Logger         Logger
+	AppName        string
+	Tags           map[string]string
+	ProfilingTypes []ProfileType
+	DisableGCRuns  bool
+	UploadRate     time.Duration
+
+	// Deprecated: the field will be removed in future releases.
+	// Use UploadRate instead.
 	DisableAutomaticResets bool
-	// Deprecated: the field is ignored and does nothing
+	// Deprecated: the field will be removed in future releases.
+	// DisableCumulativeMerge is ignored.
 	DisableCumulativeMerge bool
-	SampleRate             uint32
-	UploadRate             time.Duration
+	// Deprecated: the field will be removed in future releases.
+	// SampleRate is set to 100 and is not configurable.
+	SampleRate uint32
 }
 
 type flush struct {
@@ -118,83 +73,84 @@ type flush struct {
 }
 
 func NewSession(c SessionConfig) (*Session, error) {
-	appName, err := mergeTagsWithAppName(c.AppName, newSessionID(), c.Tags)
+	if c.UploadRate == 0 {
+		// For backward compatibility.
+		c.UploadRate = 15 * time.Second
+	}
+
+	c.Logger.Infof("starting profiling session:")
+	c.Logger.Infof("  AppName:        %+v", c.AppName)
+	c.Logger.Infof("  Tags:           %+v", c.Tags)
+	c.Logger.Infof("  ProfilingTypes: %+v", c.ProfilingTypes)
+	c.Logger.Infof("  DisableGCRuns:  %+v", c.DisableGCRuns)
+	c.Logger.Infof("  UploadRate:     %+v", c.UploadRate)
+
+	if c.DisableAutomaticResets {
+		c.UploadRate = math.MaxInt64
+	}
+
+	appNames, err := semconv.MergeTagsWithAppName(c.AppName, newSessionID().String(), c.Tags)
 	if err != nil {
 		return nil, err
 	}
 
+	// Warn if goroutine leak profiling is requested but not available.
+	// The goroutineleak profile requires Go 1.26+ with GOEXPERIMENT=goroutineleakprofile.
+	for _, pt := range c.ProfilingTypes {
+		if pt == ProfileGoroutineLeak {
+			if pprof.Lookup("goroutineleak") == nil {
+				c.Logger.Infof("goroutine leak profiling requested but not available: " +
+					"build with GOEXPERIMENT=goroutineleakprofile (requires Go 1.26+)")
+			}
+
+			break
+		}
+	}
+
 	ps := &Session{
-		upstream:               c.Upstream,
-		appName:                appName,
-		profileTypes:           c.ProfilingTypes,
-		disableGCRuns:          c.DisableGCRuns,
-		DisableAutomaticResets: c.DisableAutomaticResets,
-		sampleRate:             c.SampleRate,
-		uploadRate:             c.UploadRate,
-		stopCh:                 make(chan struct{}),
-		flushCh:                make(chan *flush),
-		logger:                 c.Logger,
-		cpuBuf:                 &bytes.Buffer{},
-		memBuf:                 &bytes.Buffer{},
-		goroutinesBuf:          &bytes.Buffer{},
-		mutexBuf:               &bytes.Buffer{},
-		blockBuf:               &bytes.Buffer{},
+		upstream:         c.Upstream,
+		appNames:         appNames,
+		profileTypes:     c.ProfilingTypes,
+		disableGCRuns:    c.DisableGCRuns,
+		uploadRate:       c.UploadRate,
+		stopCh:           make(chan struct{}),
+		flushCh:          make(chan *flush),
+		logger:           c.Logger,
+		memBuf:           &bytes.Buffer{},
+		goroutinesBuf:    &bytes.Buffer{},
+		goroutineLeakBuf: &bytes.Buffer{},
+		mutexBuf:         &bytes.Buffer{},
+		blockBuf:         &bytes.Buffer{},
 
 		deltaBlock: godeltaprof.NewBlockProfiler(),
 		deltaMutex: godeltaprof.NewMutexProfiler(),
 		deltaHeap:  godeltaprof.NewHeapProfiler(),
+		cpu:        newCPUProfileCollector(appNames.SDK, c.Upstream, c.Logger, c.UploadRate),
 	}
-	return ps, nil
-}
 
-// mergeTagsWithAppName validates user input and merges explicitly specified
-// tags with tags from app name.
-//
-// App name may be in the full form including tags (app.name{foo=bar,baz=qux}).
-// Returned application name is always short, any tags that were included are
-// moved to tags map. When merged with explicitly provided tags (config/CLI),
-// last take precedence.
-//
-// App name may be an empty string. Tags must not contain reserved keys,
-// the map is modified in place.
-func mergeTagsWithAppName(appName string, sid sessionID, tags map[string]string) (string, error) {
-	k, err := flameql.ParseKey(appName)
-	if err != nil {
-		return "", err
-	}
-	for tagKey, tagValue := range tags {
-		if flameql.IsTagKeyReserved(tagKey) {
-			continue
-		}
-		if err = flameql.ValidateTagKey(tagKey); err != nil {
-			return "", err
-		}
-		k.Add(tagKey, tagValue)
-	}
-	k.Add(sessionIDLabelName, sid.String())
-	return k.Normalized(), nil
+	return ps, nil
 }
 
 // revive:disable-next-line:cognitive-complexity complexity is fine
 func (ps *Session) takeSnapshots() {
-	var automaticResetTicker <-chan time.Time
-	if ps.DisableAutomaticResets {
-		automaticResetTicker = make(chan time.Time)
-	} else {
-		t := time.NewTicker(ps.uploadRate)
-		automaticResetTicker = t.C
-		defer t.Stop()
-	}
+	t := time.NewTicker(ps.uploadRate)
+	defer t.Stop()
 	for {
 		select {
-		case endTime := <-automaticResetTicker:
+		case endTime := <-t.C:
 			ps.reset(ps.startTime, endTime)
+
 		case f := <-ps.flushCh:
 			ps.reset(ps.startTime, ps.truncatedTime())
+			_ = ps.cpu.Flush()
 			ps.upstream.Flush()
 			f.wg.Done()
-			break
+
 		case <-ps.stopCh:
+			if ps.isCPUEnabled() {
+				ps.cpu.Stop()
+			}
+
 			return
 		}
 	}
@@ -203,6 +159,7 @@ func (ps *Session) takeSnapshots() {
 func copyBuf(b []byte) []byte {
 	r := make([]byte, len(b))
 	copy(r, b)
+
 	return r
 }
 
@@ -210,7 +167,20 @@ func (ps *Session) Start() error {
 	t := ps.truncatedTime()
 	ps.reset(t, t)
 
-	go ps.takeSnapshots()
+	ps.wg.Add(1)
+	go func() {
+		defer ps.wg.Done()
+		ps.takeSnapshots()
+	}()
+
+	if ps.isCPUEnabled() {
+		ps.wg.Add(1)
+		go func() {
+			defer ps.wg.Done()
+			ps.cpu.Start()
+		}()
+	}
+
 	return nil
 }
 
@@ -220,6 +190,7 @@ func (ps *Session) isCPUEnabled() bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -229,6 +200,7 @@ func (ps *Session) isMemEnabled() bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -238,6 +210,7 @@ func (ps *Session) isBlockEnabled() bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -247,6 +220,7 @@ func (ps *Session) isMutexEnabled() bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -256,50 +230,41 @@ func (ps *Session) isGoroutinesEnabled() bool {
 			return true
 		}
 	}
+
+	return false
+}
+
+func (ps *Session) isGoroutineLeakEnabled() bool {
+	for _, t := range ps.profileTypes {
+		if t == ProfileGoroutineLeak {
+			return true
+		}
+	}
+
 	return false
 }
 
 func (ps *Session) reset(startTime, endTime time.Time) {
 	ps.logger.Debugf("profiling session reset %s", startTime.String())
-
 	// first reset should not result in an upload
 	if !ps.startTime.IsZero() {
 		ps.uploadData(startTime, endTime)
-	} else {
-		if ps.isCPUEnabled() {
-			pprof.StartCPUProfile(ps.cpuBuf)
-		}
 	}
-
 	ps.startTime = endTime
 }
 
 func (ps *Session) uploadData(startTime, endTime time.Time) {
-	if ps.isCPUEnabled() {
-		pprof.StopCPUProfile()
-		defer func() {
-			pprof.StartCPUProfile(ps.cpuBuf)
-		}()
-		ps.upstream.Upload(&upstream.UploadJob{
-			Name:            ps.appName,
-			StartTime:       startTime,
-			EndTime:         endTime,
-			SpyName:         "gospy",
-			SampleRate:      100,
-			Units:           "samples",
-			AggregationType: "sum",
-			Format:          upstream.FormatPprof,
-			Profile:         copyBuf(ps.cpuBuf.Bytes()),
-		})
-		ps.cpuBuf.Reset()
-	}
-
 	if ps.isGoroutinesEnabled() {
 		p := pprof.Lookup("goroutine")
 		if p != nil {
-			p.WriteTo(ps.goroutinesBuf, 0)
+			err := p.WriteTo(ps.goroutinesBuf, 0)
+			if err != nil {
+				ps.logger.Errorf("failed to dump goroutines profile: %s", err)
+
+				return
+			}
 			ps.upstream.Upload(&upstream.UploadJob{
-				Name:            ps.appName,
+				Name:            ps.appNames.SDK,
 				StartTime:       startTime,
 				EndTime:         endTime,
 				SpyName:         "gospy",
@@ -316,6 +281,30 @@ func (ps *Session) uploadData(startTime, endTime time.Time) {
 				},
 			})
 			ps.goroutinesBuf.Reset()
+		}
+	}
+
+	if ps.isGoroutineLeakEnabled() {
+		p := pprof.Lookup("goroutineleak")
+		if p != nil {
+			err := p.WriteTo(ps.goroutineLeakBuf, 0)
+			if err != nil {
+				ps.logger.Errorf("failed to dump goroutine leak profile: %s", err)
+
+				return
+			}
+			ps.upstream.Upload(&upstream.UploadJob{
+				Name:             ps.appNames.SDK,
+				StartTime:        startTime,
+				EndTime:          endTime,
+				SpyName:          "gospy",
+				Units:            "goroutines",
+				AggregationType:  "average",
+				Format:           upstream.FormatPprof,
+				Profile:          copyBuf(ps.goroutineLeakBuf.Bytes()),
+				SampleTypeConfig: sampleTypeConfigGoroutineLeak,
+			})
+			ps.goroutineLeakBuf.Reset()
 		}
 	}
 
@@ -349,11 +338,12 @@ func (ps *Session) dumpHeapProfile(startTime time.Time, endTime time.Time) {
 		err := ps.deltaHeap.Profile(ps.memBuf)
 		if err != nil {
 			ps.logger.Errorf("failed to dump heap profile: %s", err)
+
 			return
 		}
 		curMemBytes := copyBuf(ps.memBuf.Bytes())
 		job := &upstream.UploadJob{
-			Name:             ps.appName,
+			Name:             ps.appNames.Godeltaprof,
 			StartTime:        startTime,
 			EndTime:          endTime,
 			SpyName:          "gospy",
@@ -374,10 +364,15 @@ func (ps *Session) dumpMutexProfile(startTime time.Time, endTime time.Time) {
 		}
 	}()
 	ps.mutexBuf.Reset()
-	ps.deltaMutex.Profile(ps.mutexBuf)
+	err := ps.deltaMutex.Profile(ps.mutexBuf)
+	if err != nil {
+		ps.logger.Errorf("failed to dump mutex profile: %s", err)
+
+		return
+	}
 	curMutexBuf := copyBuf(ps.mutexBuf.Bytes())
 	job := &upstream.UploadJob{
-		Name:             ps.appName,
+		Name:             ps.appNames.Godeltaprof,
 		StartTime:        startTime,
 		EndTime:          endTime,
 		SpyName:          "gospy",
@@ -395,10 +390,15 @@ func (ps *Session) dumpBlockProfile(startTime time.Time, endTime time.Time) {
 		}
 	}()
 	ps.blockBuf.Reset()
-	ps.deltaBlock.Profile(ps.blockBuf)
+	err := ps.deltaBlock.Profile(ps.blockBuf)
+	if err != nil {
+		ps.logger.Errorf("failed to dump block profile: %s", err)
+
+		return
+	}
 	curBlockBuf := copyBuf(ps.blockBuf.Bytes())
 	job := &upstream.UploadJob{
-		Name:             ps.appName,
+		Name:             ps.appNames.Godeltaprof,
 		StartTime:        startTime,
 		EndTime:          endTime,
 		SpyName:          "gospy",
@@ -410,32 +410,10 @@ func (ps *Session) dumpBlockProfile(startTime time.Time, endTime time.Time) {
 }
 
 func (ps *Session) Stop() {
-	ps.trieMutex.Lock()
-	defer ps.trieMutex.Unlock()
-
 	ps.stopOnce.Do(func() {
-		// TODO: wait for stopCh consumer to finish!
 		close(ps.stopCh)
-		// before stopping, upload the tries
-		ps.uploadLastBitOfData(time.Now())
+		ps.wg.Wait()
 	})
-}
-
-func (ps *Session) uploadLastBitOfData(now time.Time) {
-	if ps.isCPUEnabled() {
-		pprof.StopCPUProfile()
-		ps.upstream.Upload(&upstream.UploadJob{
-			Name:            ps.appName,
-			StartTime:       ps.startTime,
-			EndTime:         now,
-			SpyName:         "gospy",
-			SampleRate:      100,
-			Units:           "samples",
-			AggregationType: "sum",
-			Format:          upstream.FormatPprof,
-			Profile:         copyBuf(ps.cpuBuf.Bytes()),
-		})
-	}
 }
 
 func (ps *Session) flush(wait bool) {
@@ -457,58 +435,6 @@ func (ps *Session) truncatedTime() time.Time {
 func numGC() uint32 {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
+
 	return memStats.NumGC
-}
-
-const sessionIDLabelName = "__session_id__"
-
-type sessionID uint64
-
-func (s sessionID) String() string {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], uint64(s))
-	return hex.EncodeToString(b[:])
-}
-
-func newSessionID() sessionID { return globalSessionIDGenerator.newSessionID() }
-
-var globalSessionIDGenerator = newSessionIDGenerator()
-
-type sessionIDGenerator struct {
-	sync.Mutex
-	src *rand.Rand
-}
-
-func (gen *sessionIDGenerator) newSessionID() sessionID {
-	var b [8]byte
-	gen.Lock()
-	_, _ = gen.src.Read(b[:])
-	gen.Unlock()
-	return sessionID(binary.LittleEndian.Uint64(b[:]))
-}
-
-func newSessionIDGenerator() *sessionIDGenerator {
-	s, ok := sessionIDHostSeed()
-	if !ok {
-		s = sessionIDRandSeed()
-	}
-	return &sessionIDGenerator{src: rand.New(rand.NewSource(s))}
-}
-
-func sessionIDRandSeed() int64 {
-	var rndSeed int64
-	_ = binary.Read(crand.Reader, binary.LittleEndian, &rndSeed)
-	return rndSeed
-}
-
-var hostname = os.Hostname
-
-func sessionIDHostSeed() (int64, bool) {
-	v, err := hostname()
-	if err != nil {
-		return 0, false
-	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(v))
-	return int64(h.Sum64()), true
 }

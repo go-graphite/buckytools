@@ -1,12 +1,17 @@
 package pprof
 
-import (
-	"io"
-	"runtime"
-)
+type mutexPrevValue struct {
+	count    int64
+	inanosec int64
+}
+
+type mutexAccValue struct {
+	count  int64
+	cycles int64
+}
 
 type DeltaMutexProfiler struct {
-	m profMap
+	m profMap[mutexPrevValue, mutexAccValue]
 }
 
 // PrintCountCycleProfile outputs block profile records (for block or mutex profiles)
@@ -14,34 +19,64 @@ type DeltaMutexProfiler struct {
 // are done because The proto expects count and time (nanoseconds) instead of count
 // and the number of cycles for block, contention profiles.
 // Possible 'scaler' functions are scaleBlockProfile and scaleMutexProfile.
-func (d *DeltaMutexProfiler) PrintCountCycleProfile(w io.Writer, countName, cycleName string, scaler MutexProfileScaler, records []runtime.BlockProfileRecord) error {
-	// Output profile in protobuf form.
-	b := newProfileBuilder(w)
-	b.pbValueType(tagProfile_PeriodType, countName, "count")
-	b.pb.int64Opt(tagProfile_Period, 1)
-	b.pbValueType(tagProfile_SampleType, countName, "count")
-	b.pbValueType(tagProfile_SampleType, cycleName, "nanoseconds")
-
+func (d *DeltaMutexProfiler) PrintCountCycleProfile(b ProfileBuilder, scaler MutexProfileScaler,
+	records []BlockProfileRecord) error {
 	cpuGHz := float64(runtime_cyclesPerSecond()) / 1e9
 
 	values := []int64{0, 0}
 	var locs []uint64
-	for _, r := range records {
-		count, nanosec := scaleMutexProfile(scaler, r.Count, float64(r.Cycles)/cpuGHz)
+	// deduplicate: accumulate count and cycles in entry.acc for equal stacks
+	for i := range records {
+		r := &records[i]
+		entry := d.m.Lookup(blockRecordStack(r), 0)
+		entry.acc.count += r.Count // accumulate unscaled
+		entry.acc.cycles += r.Cycles
+	}
+
+	// do the delta using the accumulated values and previous values
+	for i := range records {
+		r := &records[i]
+		stk := blockRecordStack(r)
+		entry := d.m.Lookup(stk, 0)
+		accCount := entry.acc.count
+		accCycles := entry.acc.cycles
+		if accCount == 0 && accCycles == 0 {
+			continue
+		}
+		entry.acc = mutexAccValue{}
+		count, nanosec := ScaleMutexProfile(scaler, accCount, float64(accCycles)/cpuGHz)
 		inanosec := int64(nanosec)
 
 		// do the delta
-		entry := d.m.Lookup(r.Stack(), 0)
-		values[0] = count - entry.count.v1
-		values[1] = inanosec - entry.count.v2
-		entry.count.v1 = count
-		entry.count.v2 = inanosec
+		values[0] = count - entry.prev.count
+		values[1] = inanosec - entry.prev.inanosec
+		entry.prev.count = count
+		entry.prev.inanosec = inanosec
+
+		if values[0] < 0 || values[1] < 0 {
+			continue
+		}
+		if values[0] == 0 && values[1] == 0 {
+			continue
+		}
 
 		// For count profiles, all stack addresses are
 		// return PCs, which is what appendLocsForStack expects.
-		locs = b.appendLocsForStack(locs[:0], r.Stack())
-		b.pbSample(values, locs, nil)
+		locs = b.LocsForStack(stk)
+		b.Sample(values, locs, 0)
 	}
-	b.build()
+	b.Build()
+
 	return nil
+}
+
+func MutexProfileConfig() ProfileConfig {
+	return ProfileConfig{
+		PeriodType: ValueType{"contentions", "count"},
+		Period:     1,
+		SampleType: []ValueType{
+			{"contentions", "count"},
+			{"delay", "nanoseconds"},
+		},
+	}
 }

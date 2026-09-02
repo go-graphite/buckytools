@@ -71,7 +71,7 @@ cluster test fnv1a_ch replication 1
 */
 func TestFNV1aCHR(t *testing.T) {
 	chr := makeFNV1aTestCHR()
-	t.Logf(chr.String())
+	t.Log(chr.String())
 
 	dumpFNV1aRing(t, chr)
 	data := map[string]string{
