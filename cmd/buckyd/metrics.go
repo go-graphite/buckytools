@@ -620,6 +620,11 @@ func openMetricForServing(path string) (*os.File, func(), error) {
 
 	// ponytail: snapshots are rebuilt per request; move compaction into the
 	// writer if repeated merge cost becomes material.
+	srcInfo, err := src.Stat()
+	if err != nil {
+		src.Close()
+		return nil, nil, err
+	}
 	dir, err := os.MkdirTemp(tmpDir, "buckyd-ooo-")
 	if err != nil {
 		src.Close()
@@ -631,6 +636,11 @@ func openMetricForServing(path string) (*os.File, func(), error) {
 		src.Close()
 		cleanup()
 		return nil, nil, fmt.Errorf("copy metric snapshot: %w", err)
+	}
+	if err := os.Chtimes(snapshotPath, srcInfo.ModTime(), srcInfo.ModTime()); err != nil {
+		src.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("set snapshot mtime: %w", err)
 	}
 
 	// deleteMetric unlinks a sidecar without taking the lock, so it can be gone
