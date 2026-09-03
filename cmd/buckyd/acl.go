@@ -5,15 +5,15 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 type ACL struct {
+	jwt.RegisteredClaims
+
 	Namespaces []string
 	Ops        []ACLOperation // post, put, delete
 }
-
-func (*ACL) Valid() error { return nil }
 
 type ACLOperation string
 

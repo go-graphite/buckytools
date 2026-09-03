@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-import "golang.org/x/crypto/ssh/terminal"
+import "golang.org/x/term"
 import "github.com/go-graphite/buckytools/metrics"
 
 var metricWorkers int
@@ -232,7 +232,7 @@ func tarCommand(c Command) int {
 		log.Fatal("At least one argument is required.")
 	}
 
-	if terminal.IsTerminal(int(os.Stdout.Fd())) {
+	if term.IsTerminal(int(os.Stdout.Fd())) {
 		log.Fatal("Refusing to write tar file to terminal.")
 	}
 

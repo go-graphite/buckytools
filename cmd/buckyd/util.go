@@ -47,7 +47,7 @@ func copySparse(dst *os.File, src io.Reader) (written int64, err error) {
 		}
 		if er == io.EOF {
 			// Success, set the file size
-			dst.Truncate(size)
+			err = dst.Truncate(size)
 			break
 		}
 		if er != nil {

@@ -132,6 +132,7 @@ func main() {
 			SupportedHashTypes)
 	}
 	hashring = parseRing(hostname, hashType, replicas)
+	sweepMetricSnapshots()
 
 	if authJWTSecretFile != "" {
 		secret, err := ioutil.ReadFile(authJWTSecretFile)

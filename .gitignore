@@ -10,3 +10,7 @@
 /findhash
 /gentestmetrics
 .idea/
+
+# test artifacts written into their own package directories
+/fill/*.wsp
+/cmd/bucky-sparsify/sourcefile*
