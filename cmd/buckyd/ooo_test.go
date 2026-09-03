@@ -94,7 +94,7 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func TestMergeOutOfOrder(t *testing.T) {
+func TestOpenMetricForServing(t *testing.T) {
 	path, base := newSidecarMetric(t)
 
 	// The diverted point is not in the file itself yet.
@@ -102,24 +102,44 @@ func TestMergeOutOfOrder(t *testing.T) {
 		t.Fatalf("before merge: value at base+1 = %v; want NaN", got)
 	}
 
-	if err := mergeOutOfOrder(path); err != nil {
-		t.Fatalf("mergeOutOfOrder: %s", err)
+	file, cleanup, err := openMetricForServing(path)
+	if err != nil {
+		t.Fatalf("openMetricForServing: %s", err)
 	}
+	defer cleanup()
 
-	if fileExists(whisper.OutOfOrderSidecarPath(path)) {
-		t.Error("sidecar still present after merge")
+	if !fileExists(whisper.OutOfOrderSidecarPath(path)) {
+		t.Error("serving removed the live sidecar")
 	}
-	if got := valueAt(t, path, base+1); got != 7 {
-		t.Errorf("after merge: value at base+1 = %v; want 7", got)
+	if got := valueAt(t, path, base+1); !math.IsNaN(got) {
+		t.Errorf("serving modified the live file: value at base+1 = %v; want NaN", got)
+	}
+	if got := valueAt(t, file.Name(), base+1); got != 7 {
+		t.Errorf("snapshot value at base+1 = %v; want 7", got)
 	}
 	// Merging must not disturb the points that were already there.
-	if got := valueAt(t, path, base+4); got != 3 {
-		t.Errorf("after merge: value at base+4 = %v; want 3", got)
+	if got := valueAt(t, file.Name(), base+4); got != 3 {
+		t.Errorf("snapshot value at base+4 = %v; want 3", got)
 	}
 
-	// No sidecar is a cheap no-op, not an error.
-	if err := mergeOutOfOrder(path); err != nil {
-		t.Errorf("mergeOutOfOrder without a sidecar: %s", err)
+	if _, err := whisper.RemoveOutOfOrderSidecar(path); err != nil {
+		t.Fatalf("remove sidecar: %s", err)
+	}
+	live, closeLive, err := openMetricForServing(path)
+	if err != nil {
+		t.Fatalf("openMetricForServing without sidecar: %s", err)
+	}
+	defer closeLive()
+	liveInfo, err := live.Stat()
+	if err != nil {
+		t.Fatalf("stat live file: %s", err)
+	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat metric path: %s", err)
+	}
+	if !os.SameFile(liveInfo, pathInfo) {
+		t.Error("no-sidecar path did not return the live file")
 	}
 }
 
@@ -140,5 +160,46 @@ func TestDeleteMetricRemovesSidecar(t *testing.T) {
 	// With the sidecar gone the now-empty directory can be swept too.
 	if fileExists(filepath.Dir(path)) {
 		t.Error("metric directory not cleaned up")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("recreate metric directory: %s", err)
+	}
+	if err := os.WriteFile(whisper.OutOfOrderSidecarPath(path), []byte("orphan"), 0644); err != nil {
+		t.Fatalf("create orphaned sidecar: %s", err)
+	}
+	recorder := httptest.NewRecorder()
+	if err := deleteMetric(recorder, path, true); !os.IsNotExist(err) {
+		t.Fatalf("delete missing metric error = %v; want not exist", err)
+	}
+	if recorder.Code != 404 {
+		t.Errorf("delete missing metric status = %d; want 404", recorder.Code)
+	}
+	if fileExists(whisper.OutOfOrderSidecarPath(path)) {
+		t.Error("orphaned sidecar survived retry")
+	}
+}
+
+func TestSweepMetricSnapshots(t *testing.T) {
+	oldTmpDir := tmpDir
+	tmpDir = t.TempDir()
+	defer func() { tmpDir = oldTmpDir }()
+
+	stale := filepath.Join(tmpDir, "buckyd-ooo-stale")
+	if err := os.MkdirAll(filepath.Join(stale, "nested"), 0755); err != nil {
+		t.Fatalf("mkdir: %s", err)
+	}
+	keep := filepath.Join(tmpDir, "buckyd-upload")
+	if err := os.WriteFile(keep, nil, 0644); err != nil {
+		t.Fatalf("write: %s", err)
+	}
+
+	sweepMetricSnapshots()
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale snapshot still exists: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("unrelated temp file removed: %s", err)
 	}
 }

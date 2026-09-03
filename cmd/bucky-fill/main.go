@@ -11,6 +11,7 @@ import (
 
 import "github.com/go-graphite/buckytools"
 import "github.com/go-graphite/buckytools/fill"
+import whisper "github.com/go-graphite/go-whisper"
 
 var (
 	deleteSourceFiles bool
@@ -90,7 +91,7 @@ func run(source, destination string) error {
 
 func fillFile(sourceFile, destinationFile string) error {
 	if _, err := os.Stat(destinationFile); os.IsNotExist(err) {
-		if err := copyFile(sourceFile, destinationFile); err != nil {
+		if err := copyMetric(sourceFile, destinationFile); err != nil {
 			return err
 		}
 	} else {
@@ -99,7 +100,43 @@ func fillFile(sourceFile, destinationFile string) error {
 		}
 	}
 	if deleteSourceFiles {
+		// The sidecar goes first and its failure aborts the delete: dropping
+		// the metric while the sidecar survives orphans points that only get
+		// cleaned up if this exact metric is later recreated through
+		// CreateWithOptions.
+		if _, err := whisper.RemoveOutOfOrderSidecar(sourceFile); err != nil {
+			return err
+		}
 		return os.Remove(sourceFile)
+	}
+	return nil
+}
+
+func copyMetric(sourceFile, destinationFile string) error {
+	// fill can leave a sidecar of its own next to a half-written destination,
+	// so unwinding has to take both or the next run merges that debris.
+	discard := func(err error) error {
+		os.Remove(destinationFile)
+		whisper.RemoveOutOfOrderSidecar(destinationFile)
+		return err
+	}
+
+	if err := copyFile(sourceFile, destinationFile); err != nil {
+		return discard(err)
+	}
+
+	if _, err := os.Stat(whisper.OutOfOrderSidecarPath(sourceFile)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return discard(err)
+	}
+
+	// ponytail: the raw copy above already holds every on-time point, so this
+	// rewrites the whole file just to fold in a near-empty sidecar.  Swap in a
+	// targeted sidecar merge if the cost shows up on large metrics.
+	if err := fill.All(sourceFile, destinationFile); err != nil {
+		return discard(err)
 	}
 	return nil
 }

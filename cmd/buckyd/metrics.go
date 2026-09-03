@@ -203,10 +203,7 @@ func setStatHeader(w http.ResponseWriter, metric *MetricData) error {
 func deleteMetric(w http.ResponseWriter, path string, fatal bool) error {
 	err := os.Remove(path)
 	if err != nil {
-		if os.IsNotExist(err) && fatal {
-			http.Error(w, "Metric not found.", http.StatusNotFound)
-			return err
-		} else if !os.IsNotExist(err) {
+		if !os.IsNotExist(err) {
 			log.Printf("Error deleting metric %s: %s", path, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return err
@@ -214,11 +211,20 @@ func deleteMetric(w http.ResponseWriter, path string, fatal bool) error {
 	}
 	// A sidecar holds only points the compressed file rejected, so it must go
 	// with the metric.  It also has to go before the sweep below, or it keeps
-	// the metric's directory non-empty forever.
-	if _, err := whisper.RemoveOutOfOrderSidecar(path); err != nil {
-		log.Printf("Error deleting out-of-order sidecar for %s: %s", path, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	// the metric's directory non-empty forever.  It is attempted even when the
+	// metric is already gone -- that is exactly the orphaned case -- but a
+	// missing metric still answers 404 rather than reporting the sidecar.
+	_, sidecarErr := whisper.RemoveOutOfOrderSidecar(path)
+	if sidecarErr != nil {
+		log.Printf("Error deleting out-of-order sidecar for %s: %s", path, sidecarErr)
+	}
+	if os.IsNotExist(err) && fatal {
+		http.Error(w, "Metric not found.", http.StatusNotFound)
 		return err
+	}
+	if sidecarErr != nil {
+		http.Error(w, sidecarErr.Error(), http.StatusInternalServerError)
+		return sidecarErr
 	}
 
 	// removing an empty dirs left after a metric removal
@@ -550,33 +556,139 @@ func getMetricData(noEncoding bool, server, name string) (*MetricData, error) {
 	return data, nil
 }
 
-// mergeOutOfOrder folds the out-of-order sidecar of the compressed whisper file
-// at path back into the file itself.  It is a no-op when there is no sidecar,
-// which is the common case and costs a single stat.
-//
-// Merging is a full file rewrite, so it happens only when a sidecar is actually
-// present.
-func mergeOutOfOrder(path string) error {
-	if _, err := os.Stat(whisper.OutOfOrderSidecarPath(path)); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-
-	wsp, err := whisper.OpenWithOptions(path, &whisper.Options{FLock: true})
+func copyOpenFile(src *os.File, dst string) error {
+	stat, err := src.Stat()
 	if err != nil {
 		return err
 	}
-	defer wsp.Close()
 
-	if !wsp.IsCompressed() {
-		// Only the compressed format has sidecars; whatever this file is, it
-		// is not one of ours.
-		return nil
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, stat.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	n, copyErr := copySparse(out, io.NewSectionReader(src, 0, stat.Size()))
+	if copyErr == nil && n != stat.Size() {
+		copyErr = io.ErrUnexpectedEOF
+	}
+	return errors.Join(copyErr, out.Close())
+}
+
+// sweepMetricSnapshots removes snapshot directories left by a buckyd that died
+// mid-request; each one holds a full copy of a metric, so leaking them costs
+// real disk.  Unlinking a snapshot another instance is still serving is safe:
+// its descriptor stays valid until the response finishes.
+func sweepMetricSnapshots() {
+	dirs, err := filepath.Glob(filepath.Join(tmpDir, "buckyd-ooo-*"))
+	if err != nil {
+		log.Printf("Error looking for leftover metric snapshots: %s", err)
+		return
+	}
+	for _, dir := range dirs {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("Error removing leftover metric snapshot %s: %s", dir, err)
+		}
+	}
+}
+
+// openMetricForServing returns either the locked live file or a temporary copy
+// with its out-of-order sidecar merged. Compaction must not replace the live
+// inode: a writer already waiting on that inode would write into an unlinked
+// file after the rename.
+//
+// The lock is shared because serving only reads. go-whisper takes LOCK_EX to
+// write, so a shared lock still keeps carbon-cache out for as long as we hold
+// it -- and holding it spans the whole response body on the no-sidecar path --
+// while letting concurrent GETs of the same metric through.
+func openMetricForServing(path string) (*os.File, func(), error) {
+	src, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := syscall.Flock(int(src.Fd()), syscall.LOCK_SH); err != nil {
+		src.Close()
+		return nil, nil, err
 	}
 
-	return wsp.MergeOutOfOrder()
+	sidecarPath := whisper.OutOfOrderSidecarPath(path)
+	if _, err := os.Stat(sidecarPath); err != nil {
+		if os.IsNotExist(err) {
+			return src, func() { src.Close() }, nil
+		}
+		src.Close()
+		return nil, nil, err
+	}
+
+	// ponytail: snapshots are rebuilt per request; move compaction into the
+	// writer if repeated merge cost becomes material.
+	dir, err := os.MkdirTemp(tmpDir, "buckyd-ooo-")
+	if err != nil {
+		src.Close()
+		return nil, nil, err
+	}
+	cleanup := func() { os.RemoveAll(dir) }
+	snapshotPath := filepath.Join(dir, filepath.Base(path))
+	if err := copyOpenFile(src, snapshotPath); err != nil {
+		src.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("copy metric snapshot: %w", err)
+	}
+
+	// deleteMetric unlinks a sidecar without taking the lock, so it can be gone
+	// since the stat above.  There is then nothing to merge and the snapshot is
+	// already complete, so serve it rather than failing the request.
+	//
+	// The wrapping below is load-bearing: os.IsNotExist does not unwrap
+	// fmt.Errorf, which is what stops a missing sidecar from reaching
+	// serveMetric as a missing metric.  Switching either side to errors.Is
+	// would turn these into a 404.
+	if sidecar, err := os.Open(sidecarPath); err == nil {
+		err = copyOpenFile(sidecar, whisper.OutOfOrderSidecarPath(snapshotPath))
+		if cerr := sidecar.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			src.Close()
+			cleanup()
+			return nil, nil, fmt.Errorf("copy out-of-order snapshot: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		src.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("open out-of-order sidecar: %w", err)
+	}
+	if err := src.Close(); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+
+	wsp, err := whisper.Open(snapshotPath)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if wsp.IsCompressed() {
+		err = wsp.MergeOutOfOrder()
+	}
+	// A successful merge renames the finished file into place, leaving this
+	// descriptor pointing at the old inode, so failing to close it says nothing
+	// about the snapshot we are about to serve.  Log it and keep going.
+	if cerr := wsp.Close(); cerr != nil {
+		log.Printf("Error closing out-of-order snapshot for %s: %s", path, cerr)
+	}
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+
+	file, err := os.Open(snapshotPath)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return file, func() {
+		file.Close()
+		cleanup()
+	}, nil
 }
 
 // serveMetric will serve a GET request for the metric that path
@@ -586,17 +698,7 @@ func mergeOutOfOrder(path string) error {
 func serveMetric(w http.ResponseWriter, r *http.Request, path, metric string) {
 	var content io.ReadSeeker
 
-	// We serve the file's raw bytes, which do not include points diverted to
-	// an out-of-order sidecar.  Fold it in first so the receiver gets all of
-	// them -- and so stat below reports the merged size, which the client
-	// checks the transferred body against.
-	if err := mergeOutOfOrder(path); err != nil {
-		log.Printf("Error merging out-of-order sidecar for %s: %s", path, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	stat, err := statMetric(metric, path)
+	fd, cleanup, err := openMetricForServing(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.Error(w, "Metric not found.", http.StatusNotFound)
@@ -605,16 +707,18 @@ func serveMetric(w http.ResponseWriter, r *http.Request, path, metric string) {
 		}
 		return
 	}
-	fd, err := os.Open(path)
+	defer cleanup()
+
+	info, err := fd.Stat()
 	if err != nil {
-		// I know the file exists
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer fd.Close()
-	if err = syscall.Flock(int(fd.Fd()), syscall.LOCK_EX); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	stat := &MetricData{
+		Name:    metric,
+		Size:    info.Size(),
+		Mode:    int64(info.Mode()),
+		ModTime: info.ModTime().Unix(),
 	}
 
 	if r.Header.Get("accept-encoding") == "snappy" {
