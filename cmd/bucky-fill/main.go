@@ -115,10 +115,22 @@ func fillFile(sourceFile, destinationFile string) error {
 func copyMetric(sourceFile, destinationFile string) error {
 	// fill can leave a sidecar of its own next to a half-written destination,
 	// so unwinding has to take both or the next run merges that debris.
-	discard := func(err error) error {
-		os.Remove(destinationFile)
-		whisper.RemoveOutOfOrderSidecar(destinationFile)
-		return err
+	discard := func(opErr error) error {
+		var cleanupErr error
+		if err := os.Remove(destinationFile); err != nil && !os.IsNotExist(err) {
+			cleanupErr = fmt.Errorf("remove destination: %w", err)
+		}
+		if _, err := whisper.RemoveOutOfOrderSidecar(destinationFile); err != nil {
+			if cleanupErr != nil {
+				cleanupErr = fmt.Errorf("%v; remove destination sidecar: %w", cleanupErr, err)
+			} else {
+				cleanupErr = fmt.Errorf("remove destination sidecar: %w", err)
+			}
+		}
+		if cleanupErr != nil {
+			return fmt.Errorf("%w (cleanup failed: %v)", opErr, cleanupErr)
+		}
+		return opErr
 	}
 
 	if err := copyFile(sourceFile, destinationFile); err != nil {
