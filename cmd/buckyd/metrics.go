@@ -425,21 +425,12 @@ func healMetric(w http.ResponseWriter, r *http.Request, path string) {
 					return
 				}
 
-				compressStart := time.Now()
-				srcw, err := whisper.Open(srcName)
+				stats.Compress, stats.Fill, err = compressMetric(srcName, path)
 				if err != nil {
-					log.Printf("Failed to open source whisper file: %s", err)
+					log.Printf("Failed to write whisper file %s: %s", path, err)
 					httpError(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				defer srcw.Close()
-
-				if err := srcw.CompressTo(path); err != nil {
-					log.Printf("Failed to compress to whisper file %s: %s", path, err)
-					httpError(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				stats.Compress = time.Since(compressStart)
 
 				return
 			}
@@ -482,6 +473,36 @@ func healMetric(w http.ResponseWriter, r *http.Request, path string) {
 		}
 		stats.Copy = time.Since(copyStart)
 	}
+}
+
+// compressMetric writes the whisper file dumped at srcName to path in the
+// compressed format.
+//
+// healMetric only gets here when path did not exist, but go-carbon can create
+// it in the meantime and go-whisper refuses to overwrite an existing file.  The
+// dump is exactly what the backfill path wants, so fill into the file that
+// appeared rather than failing the copy with "file already exists".
+func compressMetric(srcName, path string) (compressTook, fillTook time.Duration, err error) {
+	srcw, err := whisper.Open(srcName)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open source whisper file: %w", err)
+	}
+	defer srcw.Close()
+
+	start := time.Now()
+	err = srcw.CompressTo(path)
+	if err == nil {
+		return time.Since(start), 0, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return 0, 0, err
+	}
+
+	start = time.Now()
+	if err := fill.All(srcName, path); err != nil {
+		return 0, 0, fmt.Errorf("backfill %s => %s: %w", srcName, path, err)
+	}
+	return 0, time.Since(start), nil
 }
 
 var httpClient = &http.Client{
