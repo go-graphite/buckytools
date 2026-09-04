@@ -495,7 +495,7 @@ func compressMetric(srcName, path string) (compressTook, fillTook time.Duration,
 		return time.Since(start), 0, nil
 	}
 	if !errors.Is(err, os.ErrExist) {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("compress to %s: %w", path, err)
 	}
 
 	start = time.Now()
