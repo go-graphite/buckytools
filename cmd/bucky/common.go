@@ -136,7 +136,11 @@ func SanitizeHostPort(hostport string) (string, error) {
 // DeleteMetric sends a DELETE request for the given metric to the given
 // server.  The port is assumed the same for all Bucky daemons in the
 // hash ring.
-func DeleteMetric(server, metric string) error {
+func DeleteMetric(server, metric string) error { return DeleteMetricVersion(server, metric, "") }
+
+// DeleteMetricVersion conditionally deletes when the server supplied a shared-store version.
+// Legacy file daemons ignore the absent version query and retain old behavior.
+func DeleteMetricVersion(server, metric, version string) error {
 	var err error
 	httpClient := GetHTTP()
 	u := &url.URL{
@@ -147,6 +151,11 @@ func DeleteMetric(server, metric string) error {
 	if err != nil {
 		log.Printf("Malformed hostname: %s", err)
 		return err
+	}
+	if version != "" {
+		q := u.Query()
+		q.Set("version", version)
+		u.RawQuery = q.Encode()
 	}
 
 	r, err := http.NewRequest("DELETE", u.String(), nil)

@@ -325,6 +325,7 @@ func (ms *metricSyncer) completeJobLog(job *syncJob) {
 
 func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan struct{}, wg *sync.WaitGroup) {
 	for job := range jobc {
+		completed := false
 		func() {
 			src, dst := job.SrcServer, job.DstServer
 
@@ -362,7 +363,18 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 			}
 
 			var mhstats *metricHealStats
+			var sourceVersion string
 			if ms.flags.offloadFetch {
+				if ms.flags.delete {
+					stat, err := StatRemoteMetric(src, job.OldName)
+					if err != nil {
+						atomic.AddInt64(&ms.stat.copyError, 1)
+						atomic.AddInt64(&ms.stat.nodes[src].copyError, 1)
+						ms.errorMetricLog(job.OldName, src, true)
+						return
+					}
+					sourceVersion = stat.StorageVersion
+				}
 				var err error
 				mhstats, err = CopyMetric(src, dst, job.OldName, job.NewName)
 				if err != nil {
@@ -403,6 +415,7 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 					return
 				}
 				metric.Name = job.NewName
+				sourceVersion = metric.StorageVersion
 				mhstats, err = PostMetric(dst, metric)
 				if err != nil {
 					// errors already logged in the func
@@ -445,18 +458,22 @@ func (ms *metricSyncer) sync(jobc chan *syncJob, srcThrottling map[string]chan s
 			if ms.flags.delete {
 				deleteStart := time.Now()
 
-				err := DeleteMetric(src, job.OldName)
+				err := DeleteMetricVersion(src, job.OldName, sourceVersion)
 				if err != nil {
 					// errors already logged in the func
 					atomic.AddInt64(&ms.stat.deleteError, 1)
 					atomic.AddInt64(&ms.stat.nodes[src].deleteError, 1)
+					return
 				}
 
 				atomic.AddInt64(&ms.stat.time.delete.count, 1)
 				atomic.AddInt64(&ms.stat.time.delete.total, int64(time.Since(deleteStart)))
 			}
+			completed = true
 		}()
-		ms.completeJobLog(job)
+		if completed {
+			ms.completeJobLog(job)
+		}
 	}
 
 	wg.Done()

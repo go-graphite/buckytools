@@ -164,6 +164,14 @@ __NOTE: The payload needs to be valid JSON.__
 Client Usage
 ============
 
+The bucky client also supports go-carbon's embedded buckyd API for shared
+Whisper storage. Transfers use the existing metric-body and JWT protocol, so
+file and shared nodes can be mixed. A shared source supplies `StorageVersion`;
+copy/rebalance with deletion sends it back in a conditional DELETE. Concurrent
+writes cause HTTP 409 and retain the source. Failed copy/delete jobs remain
+retryable. File daemons without a version retain their existing behavior. The
+standalone buckyd implementation is unchanged; it must not open a shared store.
+
 The **bucky** tool is self documenting.  You can run:
 
     bucky help
