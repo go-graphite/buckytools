@@ -51,6 +51,9 @@ These are the tools included and their functionality.
   interacting with the raw metric DBs on disk.
 * **bucky** -- Command line Graphite cluster manager.  Modules:
   * **backfill** -- Backfill old metrics into new names.
+  * **cleanup-orphan** -- Remove local `.ooo` files whose corresponding `.wsp`
+    is gone, preserving all lock files. Lists candidates by default; use
+    `-delete <whisper-directory>` when metrics cannot be recreated concurrently.
   * **delete** -- Delete metrics via list or regular expression.
   * **du** -- Measure the storage consumed by a list of regular expression of
     metrics.
