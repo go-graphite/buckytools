@@ -278,14 +278,18 @@ func TestMergeOOOFailurePreservesSidecar(t *testing.T) {
 	if err := os.WriteFile(sidecar, []byte("invalid"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	// A failure must not stop later metrics from merging.
+	good := filepath.Join(root, "next.wsp")
+	goodBase := createOOOMergeMetric(t, good)
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	count, err := mergeOOOSidecars(root, 0, 500, io.Discard)
-	if count != 0 || err == nil {
+	if count != 1 || !errors.Is(err, errOOOMergeFailed) {
 		t.Fatalf("count=%d, err=%v", count, err)
 	}
+	checkOOOMergeValues(t, good, goodBase)
 	after, readErr := os.ReadFile(path)
 	if readErr != nil || !bytes.Equal(before, after) {
 		t.Fatalf("metric changed after failed merge: %v", readErr)

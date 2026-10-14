@@ -27,7 +27,7 @@ func init() {
 			return 2
 		}
 		count, err := mergeOOOSidecars(c.Flag.Arg(0), maxRun, speed, os.Stdout)
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, errOOOMergeFailed) {
 			log.Printf("Merged %d sidecars; max-run reached", count)
 			return 0
 		}
@@ -55,6 +55,8 @@ lock database inodes before running this command.`)
 	c.Flag.DurationVar(&maxRun, "max-run", 0, "Maximum run duration; 0s means unlimited. An ongoing merge finishes before stopping.")
 	c.Flag.IntVar(&speed, "speed", 500, "Maximum number of sidecar merges per second (must be positive).")
 }
+
+var errOOOMergeFailed = errors.New("OOO merge failed")
 
 func mergeOOOSidecars(root string, maxRun time.Duration, speed int, output io.Writer) (int, error) {
 	if maxRun < 0 || speed <= 0 {
@@ -85,7 +87,7 @@ func mergeOOOSidecars(root string, maxRun time.Duration, speed int, output io.Wr
 	if time.Second%time.Duration(speed) != 0 {
 		interval++
 	}
-	count := 0
+	count, failed := 0, 0
 	var nextMerge time.Time
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
@@ -111,20 +113,29 @@ func mergeOOOSidecars(root string, maxRun time.Duration, speed int, output io.Wr
 			return err
 		}
 		err = mergeOOOFile(ctx, path)
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			// A writer or another maintenance process removed the candidate.
 			return nil
 		}
-		if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 			return fmt.Errorf("merge %s: %w", path, err)
 		}
-		count++
 		nextMerge = time.Now().Add(interval)
+		if err != nil {
+			// One bad metric must not block the rest of the tree.
+			log.Printf("OOO merge failed for %s: %s", path, err)
+			failed++
+			return ctx.Err()
+		}
+		count++
 		if _, err := fmt.Fprintln(output, path); err != nil {
 			return err
 		}
 		return ctx.Err()
 	})
+	if failed > 0 {
+		err = errors.Join(fmt.Errorf("%w: %d metrics", errOOOMergeFailed, failed), err)
+	}
 	return count, err
 }
 
@@ -158,6 +169,8 @@ func mergeOOOFile(ctx context.Context, path string) error {
 	return errors.Join(wsp.MergeOutOfOrder(), wsp.Close())
 }
 
+// oooMergeLockPath must match go-whisper's persistent lock path exactly.
+// TODO: replace with whisper.PathLockPath once vendor includes it.
 func oooMergeLockPath(path string) string {
 	name := filepath.Base(path)
 	if len(name)+len(".lock") <= 255 {
