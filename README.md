@@ -62,6 +62,11 @@ These are the tools included and their functionality.
   * **json** -- Convert newline separated lists to JSON arrays.
   * **list** -- Discover and verify metrics.
   * **locate** -- Calculate metric locations from the hash ring.
+  * **merge-ooo** -- Merge local `.wsp.ooo` sidecars into compressed `.wsp`
+    files under `<whisper-directory>`, holding exclusive metric and sidecar
+    locks. Use `-max-run <duration>` (default `0s`, unlimited) and
+    `-speed <merges-per-second>` (default `500`). An ongoing merge finishes
+    before stopping. Concurrent writers must use persistent `.lock` files.
   * **modify** -- Resize archive or change aggregation policy.
   * **rebalance** -- Move inconsistent metrics to the correct location
     and delete the source immediately after successful backfill.
