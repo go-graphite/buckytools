@@ -353,7 +353,15 @@ func healMetric(w http.ResponseWriter, r *http.Request, path string) {
 	if dstExists {
 		// Write request body to a tmpfile
 		tmpStart := time.Now()
-		fd, err := ioutil.TempFile(tmpDir, "buckyd")
+		uploadDir, err := os.MkdirTemp(tmpDir, "buckyd-upload-")
+		if err != nil {
+			log.Printf("Error creating upload directory: %s", err)
+			httpError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// This private directory also owns any persistent locks created by fill.
+		defer os.RemoveAll(uploadDir)
+		fd, err := os.CreateTemp(uploadDir, "metric-")
 		if err != nil {
 			log.Printf("Error creating temp file: %s", err)
 			httpError(w, err.Error(), http.StatusInternalServerError)
@@ -365,7 +373,6 @@ func healMetric(w http.ResponseWriter, r *http.Request, path string) {
 		stats.Dump = time.Since(tmpStart)
 
 		fillStart := time.Now()
-		defer os.Remove(srcName) // not concerned with errors here
 		if err != nil || nr != stat.Size {
 			if err != nil {
 				log.Printf("Error writing to temp file: %s", err)
@@ -401,7 +408,14 @@ func healMetric(w http.ResponseWriter, r *http.Request, path string) {
 			// src file is not compressed, dump it and compress it
 			if !bytes.Equal(magicFromData, magic) {
 				tmpStart := time.Now()
-				fd, err := ioutil.TempFile(tmpDir, "buckyd")
+				uploadDir, err := os.MkdirTemp(tmpDir, "buckyd-upload-")
+				if err != nil {
+					log.Printf("Error creating upload directory: %s", err)
+					httpError(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				defer os.RemoveAll(uploadDir)
+				fd, err := os.CreateTemp(uploadDir, "metric-")
 				if err != nil {
 					log.Printf("Error creating temp file: %s", err)
 					httpError(w, err.Error(), http.StatusInternalServerError)
@@ -412,7 +426,6 @@ func healMetric(w http.ResponseWriter, r *http.Request, path string) {
 				fd.Close()
 				stats.Dump = time.Since(tmpStart)
 
-				defer os.Remove(srcName) // not concerned with errors here
 				if err != nil || nr != stat.Size {
 					if err != nil {
 						log.Printf("Error writing to temp file: %s", err)
