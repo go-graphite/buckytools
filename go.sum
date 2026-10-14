@@ -5,6 +5,10 @@ github.com/felixge/httpsnoop v1.0.3 h1:s/nj+GCswXYzN5v2DpNMuMQYe+0DDwt5WVCU6CWBd
 github.com/felixge/httpsnoop v1.0.3/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
 github.com/go-graphite/go-whisper v0.0.0-20260902151236-ae9d64118114 h1:IVeaJ+8tMua4T9ES+jwDgJbRHtPrSdl7JD3neYSAJH0=
 github.com/go-graphite/go-whisper v0.0.0-20260902151236-ae9d64118114/go.mod h1:1edRhfqJoiHSjN72nYptHK0YR4yYt8aPC4NRHWhT0XE=
+github.com/go-graphite/go-whisper v0.0.0-20261014111607-842cd9a1d542 h1:vbadlXcJ3/p7+N2oeSIuS7VSg4rm7diOVwui1Xz7AfI=
+github.com/go-graphite/go-whisper v0.0.0-20261014111607-842cd9a1d542/go.mod h1:1edRhfqJoiHSjN72nYptHK0YR4yYt8aPC4NRHWhT0XE=
+github.com/go-graphite/go-whisper v0.0.0-20261014114435-6a46c2e38c39 h1:ZN3gmN3DWUHr9KbNqHfXPvQNqXU+qy68FJeZ1bLP1Jw=
+github.com/go-graphite/go-whisper v0.0.0-20261014114435-6a46c2e38c39/go.mod h1:1edRhfqJoiHSjN72nYptHK0YR4yYt8aPC4NRHWhT0XE=
 github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
 github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
 github.com/golang/snappy v0.0.4 h1:yAGX7huGHXlcLOEtBnF4w7FQwA26wojNCwOYAEhLjQM=

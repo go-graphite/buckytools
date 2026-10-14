@@ -9,10 +9,11 @@ package whisper
 // backfill into an existing file impossible.
 //
 // With Options.OutOfOrder set, those points are diverted into a sidecar: a plain
-// *classic* whisper file named "<path>.ooo", with identical retentions,
-// aggregation method and xFilesFactor, created sparse. Classic whisper is
-// already a random-order, point-addressable store with retention enforcement
-// and per-slot dedup, so no new file format is involved.
+// *classic* whisper file normally named "<path>.ooo", with identical retentions,
+// aggregation method and xFilesFactor, created sparse. Near the filesystem's
+// filename limit, the sidecar uses a stable hashed name in the same directory.
+// Classic whisper is already a random-order, point-addressable store with
+// retention enforcement and per-slot dedup, so no new file format is involved.
 //
 // The compressed file itself stays byte-compatible, so unmodified readers keep
 // working; they simply do not see the diverted points. Fetch merges the sidecar
@@ -22,6 +23,9 @@ package whisper
 // Two things callers own. Merging is a full file rewrite, so it is theirs to
 // rate-limit (OutOfOrderPoints says how much has accumulated). And deleting a
 // metric must delete its sidecar: see RemoveOutOfOrderSidecar.
+// Explicit historical corrections to coarse archives are applied synchronously
+// in one rewrite with pending sidecar data; they cannot use partial-aggregate
+// sidecar precedence or wait for the caller's compaction schedule.
 
 import (
 	"errors"
@@ -29,9 +33,10 @@ import (
 	"math"
 	"os"
 	"sort"
+	"time"
 )
 
-// oooSuffix is appended to the compressed file's path to name its sidecar.
+// oooSuffix is appended to the compressed file's path when the result fits.
 // It deliberately does not end in ".wsp": go-carbon's carbonserver indexes
 // metrics by that suffix, and sidecars must stay invisible to find/glob.
 const oooSuffix = ".ooo"
@@ -53,8 +58,9 @@ type oooPoint struct {
 }
 
 // extraPoint is a point folded into an archive during a rewrite. replace marks
-// it as superseding the file's own value at the same interval, which is true of
-// recomputed aggregates and false of raw sidecar points.
+// it as superseding the file's own value at the same interval. Base-archive
+// corrections and recomputed aggregates replace stored values; partial coarse
+// aggregates only fill holes.
 type extraPoint struct {
 	dataPoint
 	replace bool
@@ -89,7 +95,7 @@ func (whisper *Whisper) oooEnabled() bool {
 		!whisper.opts.InMemory
 }
 
-func (whisper *Whisper) oooSidecarPath() string { return whisper.file.Name() + oooSuffix }
+func (whisper *Whisper) oooSidecarPath() string { return OutOfOrderSidecarPath(whisper.file.Name()) }
 
 // detectOOO records whether a sidecar is present, so the read path can skip the
 // open entirely for the overwhelmingly common case of a file that has never
@@ -132,10 +138,7 @@ func (whisper *Whisper) discardOrphanedOOO() {
 	}
 	if err := os.Remove(path); err != nil {
 		whisper.NonFatalErrors = append(whisper.NonFatalErrors, fmt.Errorf("remove orphaned out-of-order sidecar %s: %w", path, err))
-		return
 	}
-
-	whisper.NonFatalErrors = append(whisper.NonFatalErrors, fmt.Errorf("removed orphaned out-of-order sidecar %s", path))
 }
 
 func (whisper *Whisper) oooOptions() *Options {
@@ -312,14 +315,12 @@ func (whisper *Whisper) divertOutOfOrder(dropped []oooPoint) error {
 // compressed archives.
 //
 // The sidecar shares the main file's retentions, so archive i covers the same
-// intervals at the same step and the two value slices are directly aligned. A
-// value is taken from the sidecar only where the compressed file has none: on-time
-// data stays authoritative, and for a coarse archive a partial aggregate is used
-// only when nothing on time covered that window at all.
-//
-// So a diverted point shows up immediately at base resolution, but a coarse
-// window that already holds an aggregate keeps the stale one until
-// MergeOutOfOrder recomputes it - the encoded slot cannot be rewritten in place.
+// intervals at the same step and the two value slices are directly aligned.
+// Base-archive sidecar points are later writes, so they replace encoded values.
+// Coarse sidecar points can be partial aggregates. Fill holes with those, then
+// recompute affected windows from the union of main data and corrections using
+// the same rules as compaction. An acknowledged correction is visible at every
+// resolution without requiring a file rewrite on the read path.
 func (whisper *Whisper) mergeOutOfOrderValues(archiveIndex, fromTime, untilTime int, values []float64) error {
 	if whisper.oooBroken {
 		return nil
@@ -344,6 +345,27 @@ func (whisper *Whisper) mergeOutOfOrderValues(archiveIndex, fromTime, untilTime 
 	if archiveIndex >= len(sidecar.archives) {
 		return nil
 	}
+	if archiveIndex == 0 {
+		// Fetch represents both an empty slot and an explicit NaN as NaN.
+		// Inspect timestamps so a NaN correction still replaces a main value.
+		archive := sidecar.archives[0]
+		base := sidecar.getBaseInterval(archive)
+		if len(values) == 0 || base == 0 {
+			return nil
+		}
+		from := archive.Interval(fromTime)
+		until := from + len(values)*archive.secondsPerPoint
+		points, err := sidecar.readSeries(archive.PointOffset(base, from), archive.PointOffset(base, until), archive)
+		if err != nil {
+			return fmt.Errorf("fetch out-of-order raw slots: %w", err)
+		}
+		for i, point := range points {
+			if i < len(values) && point.interval == from+i*archive.secondsPerPoint {
+				values[i] = point.value
+			}
+		}
+		return nil
+	}
 
 	ts, err := sidecar.fetchFromArchive(sidecar.archives[archiveIndex], fromTime, untilTime)
 	if err != nil {
@@ -357,8 +379,30 @@ func (whisper *Whisper) mergeOutOfOrderValues(archiveIndex, fromTime, untilTime 
 		if i >= len(values) {
 			break
 		}
-		if math.IsNaN(values[i]) && !math.IsNaN(v) {
+		if !math.IsNaN(v) && (archiveIndex == 0 || math.IsNaN(values[i])) {
 			values[i] = v
+		}
+	}
+	if archiveIndex > 0 {
+		extras := make([][]dataPoint, archiveIndex+1)
+		from := whisper.archives[archiveIndex].Interval(fromTime)
+		until := from + len(values)*whisper.archives[archiveIndex].secondsPerPoint - 1
+		for i := 0; i < archiveIndex; i++ {
+			extras[i], err = readArchivePointsInRange(sidecar, i, from, until)
+			if err != nil {
+				return fmt.Errorf("read out-of-order rollup input: %w", err)
+			}
+		}
+		recomputed, err := whisper.recomputeAggregates(extras)
+		if err != nil {
+			return fmt.Errorf("recompute out-of-order read: %w", err)
+		}
+		archive := whisper.archives[archiveIndex]
+		for _, point := range recomputed[archiveIndex] {
+			index := (point.interval - from) / archive.secondsPerPoint
+			if point.interval >= from && index < len(values) {
+				values[index] = point.value
+			}
 		}
 	}
 
@@ -374,75 +418,166 @@ func (whisper *Whisper) mergeOutOfOrderValues(archiveIndex, fromTime, untilTime 
 //
 // The sidecar is deleted only after the merged file has been renamed into place.
 // A crash in between leaves a sidecar whose points are already in the main file,
-// which is harmless: on read the main file wins.
+// which is harmless: base values match and coarse main-file aggregates win.
 //
 // IMPORTANT: like UpdateConfig, this replaces the underlying file. The caller
 // should reopen the path rather than keep using stale handles to it.
 func (whisper *Whisper) MergeOutOfOrder() error {
+	_, err := whisper.mergeOutOfOrder(nil)
+	return err
+}
+
+// OutOfOrderMergeOptions controls when a sidecar is worth compacting. Counts
+// include live records at every retention, including propagated aggregates.
+// Ages refer to sample timestamps, not filesystem times or time since arrival.
+// Zero limits are disabled; all-zero options request an unconditional merge.
+type OutOfOrderMergeOptions struct {
+	MinPoints       int
+	MaxPointAge     time.Duration
+	RetentionMargin time.Duration
+}
+
+// MergeOutOfOrderWithOptions scans the sidecar with bounded scratch space and
+// merges when any enabled limit is reached. RetentionMargin makes records close
+// to expiry eligible even below MinPoints. It also cleans up empty/expired
+// sidecars. The bool reports a completed merge/cleanup, not mere eligibility.
+// Callers must rate-limit checks and arrange retries, including for idle metrics
+// if they need an age deadline; this method does not schedule background work.
+func (whisper *Whisper) MergeOutOfOrderWithOptions(options OutOfOrderMergeOptions) (bool, error) {
+	if options.MinPoints < 0 || options.MaxPointAge < 0 || options.RetentionMargin < 0 {
+		return false, errors.New("out-of-order merge limits must not be negative")
+	}
+	return whisper.mergeOutOfOrder(&options)
+}
+
+func (whisper *Whisper) mergeOutOfOrder(options *OutOfOrderMergeOptions) (bool, error) {
+	return whisper.mergeOutOfOrderAt(options, Now())
+}
+
+// mergeOutOfOrderAt is used by offline snapshotting to choose an explicit
+// retention horizon without changing the package-global Now hook.
+func (whisper *Whisper) mergeOutOfOrderAt(options *OutOfOrderMergeOptions, now time.Time) (bool, error) {
+	return whisper.mergeOutOfOrderWithCorrections(options, now, nil)
+}
+
+func (whisper *Whisper) mergeOutOfOrderWithCorrections(options *OutOfOrderMergeOptions, now time.Time, corrections [][]dataPoint) (bool, error) {
 	if !whisper.compressed {
-		return errors.New("out-of-order merge is only supported for the compressed format")
+		return false, errors.New("out-of-order merge is only supported for the compressed format")
 	}
 	if whisper.aggregationMethod == Mix {
 		// oooEnabled refuses to create one under Mix, and classic whisper
 		// refuses the duplicated retentions Mix reports, so a Mix sidecar
 		// should not exist; say so rather than take an untested path.
-		return errors.New("out-of-order merge is not supported for mix aggregation")
+		return false, errors.New("out-of-order merge is not supported for mix aggregation")
 	}
 
 	sidecar, err := whisper.oooSidecar(false)
 	if err != nil {
-		return fmt.Errorf("merge out-of-order points: %w", err)
+		return false, fmt.Errorf("merge out-of-order points: %w", err)
 	}
 	if sidecar == nil {
 		if whisper.oooBroken {
 			whisper.oooPath = whisper.oooSidecarPath()
-			return fmt.Errorf("merge out-of-order points: %w", errOOOIncompatible)
+			return false, fmt.Errorf("merge out-of-order points: %w", errOOOIncompatible)
 		}
 		// nothing usable to merge
 		whisper.oooPath = ""
 		whisper.OutOfOrderPoints = 0
-		return nil
+		if corrections == nil {
+			return false, nil
+		}
 	}
 
 	extras := make([][]dataPoint, len(whisper.archives))
 	for i := range whisper.archives {
-		if i >= len(sidecar.archives) {
+		if sidecar == nil || i >= len(sidecar.archives) {
 			break
 		}
-		if extras[i], err = readArchivePoints(sidecar, i); err != nil {
+		if extras[i], err = readArchivePointsAt(sidecar, i, now); err != nil {
 			whisper.closeOOO()
-			return fmt.Errorf("merge out-of-order points: %w", err)
+			return false, fmt.Errorf("merge out-of-order points: %w", err)
 		}
 	}
-
-	sidecarPath := sidecar.file.Name()
-	if err := whisper.closeOOO(); err != nil {
-		return fmt.Errorf("merge out-of-order points: %w", err)
+	if options != nil && !whisper.shouldMergeOutOfOrder(extras, *options, now) {
+		return false, nil
 	}
 
-	recomputed, err := whisper.recomputeAggregates(extras)
+	var sidecarPath string
+	if sidecar != nil {
+		sidecarPath = sidecar.file.Name()
+	}
+	if err := whisper.closeOOO(); err != nil {
+		return false, fmt.Errorf("merge out-of-order points: %w", err)
+	}
+
+	recomputed, err := whisper.recomputeArchiveAggregates(extras, corrections)
 	if err != nil {
-		return fmt.Errorf("merge out-of-order points: %w", err)
+		return false, fmt.Errorf("merge out-of-order points: %w", err)
 	}
 	pending := make([][]extraPoint, len(extras))
 	for i := range extras {
-		pending[i] = combineExtras(extras[i], recomputed[i])
+		pending[i] = combineExtras(extras[i], recomputed[i], i == 0)
 	}
 
 	// reuse the extension sizing so a rewrite that is already overdue is not
 	// wasted, and so the added points get a little more room where needed
 	rets, _, _ := whisper.computeExtendedRetentions()
-	if err := whisper.rewrite(rets, "compact", func(i int) []extraPoint { return pending[i] }); err != nil {
-		return fmt.Errorf("merge out-of-order points: %w", err)
+	op := "compact"
+	if corrections != nil {
+		op = "correct"
+	}
+	if err := whisper.rewrite(rets, op, func(i int) []extraPoint { return pending[i] }); err != nil {
+		return false, fmt.Errorf("merge out-of-order points: %w", err)
 	}
 
-	if err := os.Remove(sidecarPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove out-of-order sidecar %s: %w", sidecarPath, err)
+	// The merge itself is done here: the points are in the main file and the
+	// rewrite has been renamed into place. A sidecar that will not delete is
+	// therefore stale rather than pending, so latch it unusable and report it
+	// non-fatally. Returning an error instead would leave oooPath set, and the
+	// caller would redo the whole file rewrite on every subsequent write,
+	// spending its compaction budget on data that is already merged.
+	//
+	// Reopening the file does pick the leftover up again and merge it once more,
+	// harmlessly (base values match and coarse main-file values win), so the
+	// waste is bounded per open rather than per write.
+	if err := removeSidecar(sidecarPath); err != nil {
+		whisper.markOOOBroken(fmt.Errorf("remove out-of-order sidecar %s: %w", sidecarPath, err))
+		whisper.OutOfOrderPoints = 0
+
+		return true, nil
 	}
 	whisper.oooPath = ""
 	whisper.OutOfOrderPoints = 0
 
+	return true, nil
+}
+
+func removeSidecar(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return nil
+}
+
+func (whisper *Whisper) shouldMergeOutOfOrder(extras [][]dataPoint, options OutOfOrderMergeOptions, now time.Time) bool {
+	count := 0
+	for i, points := range extras {
+		count += len(points)
+		for _, p := range points {
+			timestamp := time.Unix(int64(p.interval), 0)
+			if options.MaxPointAge > 0 && now.Sub(timestamp) >= options.MaxPointAge {
+				return true
+			}
+			expires := timestamp.Add(time.Duration(whisper.archives[i].MaxRetention()) * time.Second)
+			if options.RetentionMargin > 0 && !expires.After(now.Add(options.RetentionMargin)) {
+				return true
+			}
+		}
+	}
+	return count == 0 || (options.MinPoints > 0 && count >= options.MinPoints) || options == (OutOfOrderMergeOptions{})
 }
 
 // recomputeAggregates recalculates the coarse archives over every window a
@@ -467,12 +602,35 @@ func (whisper *Whisper) MergeOutOfOrder() error {
 // recomputed aggregate does. Windows that fail xFilesFactor are left alone
 // rather than written as a partial aggregate.
 func (whisper *Whisper) recomputeAggregates(extras [][]dataPoint) ([][]dataPoint, error) {
-	out := make([][]dataPoint, len(whisper.archives))
+	return whisper.recomputeArchiveAggregates(extras, nil)
+}
+
+// Explicit coarse corrections cannot use the sidecar's gap-fill precedence.
+// This uncommon historical-write path trades a rewrite for an unambiguous,
+// format-compatible result; ordinary late base samples still use the sidecar.
+func (whisper *Whisper) rewriteArchiveCorrections(corrections [][]dataPoint) error {
+	// Fold sidecar gap fills and the corrections into the same rewrite.
+	_, err := whisper.mergeOutOfOrderWithCorrections(nil, Now(), corrections)
+	return err
+}
+
+func (whisper *Whisper) recomputeArchiveAggregates(extras, corrections [][]dataPoint) ([][]dataPoint, error) {
+	out := make([][]dataPoint, len(extras))
 	if len(whisper.archives) < 2 || whisper.aggregationMethod == Mix {
 		return out, nil
 	}
 
-	for i := 0; i+1 < len(whisper.archives); i++ {
+	for i := range extras {
+		if corrections != nil {
+			// Direct writes follow propagation from finer archives, so they win
+			// at the same slot before computing the next resolution down. The
+			// buffered rollups materializeBufferedContinuation passes here get
+			// the same precedence over a recompute from the finer archive.
+			out[i], _ = mergeExtra(out[i], markExtras(corrections[i], true), maxInt)
+		}
+		if i+1 == len(extras) {
+			break
+		}
 		higher, lower := whisper.archives[i], whisper.archives[i+1]
 
 		// what changes archive i: the sidecar points folded into it, plus what
@@ -480,11 +638,7 @@ func (whisper *Whisper) recomputeAggregates(extras [][]dataPoint) ([][]dataPoint
 		// diverted at any archive, not only the base one, so a level with no
 		// change above it can still have one of its own - hence continue rather
 		// than stopping the cascade here.
-		changed := make([]dataPoint, 0, len(extras[i])+len(out[i]))
-		changed = append(changed, extras[i]...)
-		changed = append(changed, out[i]...)
-
-		touched := windowsOf(higher, changed)
+		touched := windowsOf(higher, extras[i], out[i])
 		if len(touched) == 0 {
 			continue
 		}
@@ -496,9 +650,10 @@ func (whisper *Whisper) recomputeAggregates(extras [][]dataPoint) ([][]dataPoint
 
 		perWindow := lower.secondsPerPoint / higher.secondsPerPoint
 
-		var next []dataPoint
+		next := make([]dataPoint, 0, len(touched))
+		known := make([]float64, 0, perWindow)
 		for _, start := range touched {
-			var known []float64
+			known = known[:0]
 			for t := start; t < start+lower.secondsPerPoint; t += higher.secondsPerPoint {
 				if v, ok := values[t]; ok {
 					known = append(known, v)
@@ -510,7 +665,6 @@ func (whisper *Whisper) recomputeAggregates(extras [][]dataPoint) ([][]dataPoint
 			next = append(next, dataPoint{start, aggregate(whisper.aggregationMethod, known)})
 		}
 
-		sort.Slice(next, func(a, b int) bool { return next[a].interval < next[b].interval })
 		out[i+1] = next
 	}
 
@@ -535,21 +689,24 @@ func (whisper *Whisper) mergedArchiveValues(index int, sidecar, recomputed []dat
 		until = archive.AggregateInterval(until) + archive.next.secondsPerPoint - archive.secondsPerPoint
 	}
 
-	series, err := whisper.storedPoints(archive, from, until)
+	// The shared live-rollup reader applies XFF and includes buffered tail
+	// windows. They are necessary when a correction cascades past a coarse
+	// archive whose final values have not yet reached encoded blocks.
+	series, err := whisper.fetchCompressed(int64(from), int64(until), archive)
 	if err != nil {
 		return nil, fmt.Errorf("recompute aggregates: read archive %d: %w", index, err)
 	}
 
-	values := make(map[int]float64, len(series)+len(sidecar)+len(recomputed))
+	values := make(map[int]float64, len(series))
 	for _, p := range series {
 		if p.interval != 0 {
 			values[p.interval] = p.value
 		}
 	}
-	// the file is authoritative over the sidecar, but a recomputed aggregate is
-	// strictly better informed than either
+	// Base-archive sidecar points are corrections. Coarse sidecar points may
+	// contain only partial aggregates; a recomputed aggregate supersedes both.
 	for _, p := range sidecar {
-		if _, ok := values[p.interval]; !ok {
+		if _, ok := values[p.interval]; index == 0 || !ok {
 			values[p.interval] = p.value
 		}
 	}
@@ -563,9 +720,11 @@ func (whisper *Whisper) mergedArchiveValues(index int, sidecar, recomputed []dat
 // combineExtras interleaves the sidecar points with the recomputed aggregates
 // for one archive, ascending. A recomputed aggregate supersedes the sidecar
 // point at the same interval and is marked to supersede the file's too.
-func combineExtras(sidecar, recomputed []dataPoint) []extraPoint {
+// replaceSidecar is true only for base-archive corrections, never for partial
+// coarse aggregates.
+func combineExtras(sidecar, recomputed []dataPoint, replaceSidecar bool) []extraPoint {
 	if len(recomputed) == 0 {
-		return markExtras(sidecar, false)
+		return markExtras(sidecar, replaceSidecar)
 	}
 	if len(sidecar) == 0 {
 		return markExtras(recomputed, true)
@@ -576,7 +735,7 @@ func combineExtras(sidecar, recomputed []dataPoint) []extraPoint {
 	for i < len(sidecar) && j < len(recomputed) {
 		switch {
 		case sidecar[i].interval < recomputed[j].interval:
-			out = append(out, extraPoint{dataPoint: sidecar[i]})
+			out = append(out, extraPoint{dataPoint: sidecar[i], replace: replaceSidecar})
 			i++
 		case sidecar[i].interval > recomputed[j].interval:
 			out = append(out, extraPoint{dataPoint: recomputed[j], replace: true})
@@ -587,7 +746,7 @@ func combineExtras(sidecar, recomputed []dataPoint) []extraPoint {
 			j++
 		}
 	}
-	out = append(out, markExtras(sidecar[i:], false)...)
+	out = append(out, markExtras(sidecar[i:], replaceSidecar)...)
 	out = append(out, markExtras(recomputed[j:], true)...)
 
 	return out
@@ -611,21 +770,44 @@ func markExtras(points []dataPoint, replace bool) []extraPoint {
 //
 // This is fetchCompressed without its tail. For a non-base archive that
 // function also live aggregates whatever sits in the higher archives' buffers,
-// which is not what the file holds: it ignores xFilesFactor and drops its own
-// trailing group. Feeding those phantom values into an aggregation would inflate
-// the known-slot count and could fold a partial aggregate into a stored one.
-//
-// No reachable case is known - a diverted point is by construction older than
-// the buffers that would pollute it - but that argument rests on the ratio
-// between every adjacent pair of retentions, which callers choose. Reading
-// exactly what the file holds costs a few lines and does not.
+// which need not be physically present in the selected archive. Migration and
+// archive snapshots use this helper to preserve only the stored records.
 func (whisper *Whisper) storedPoints(archive *archiveInfo, from, until int) ([]dataPoint, error) {
-	var dst []dataPoint
-
-	buf := make([]byte, archive.blockSize)
-	for _, block := range archive.getSortedBlockRanges() {
-		if block.end < from || until < block.start {
+	blocks := archive.getSortedBlockRanges()
+	capacity := 0
+	for _, block := range blocks {
+		if block.start == 0 || block.end < from || until < block.start {
 			continue
+		}
+		first, last := block.start, block.end
+		if first < from {
+			first = from
+		}
+		if last > until {
+			last = until
+		}
+		count := (last-first)/archive.secondsPerPoint + 1
+		// Metadata is only a capacity hint; malformed counts cannot force
+		// allocations larger than the block's maximum encoded capacity.
+		if block.count >= 0 && block.count < maxInt && block.count/4 < archive.blockSize && count > block.count+1 {
+			count = block.count + 1
+		}
+		if count > archive.numberOfPoints-capacity {
+			count = archive.numberOfPoints - capacity
+		}
+		capacity += count
+	}
+	var dst []dataPoint
+	if capacity > 0 {
+		dst = make([]dataPoint, 0, capacity)
+	}
+	var buf []byte
+	for _, block := range blocks {
+		if block.start == 0 || block.end < from || until < block.start {
+			continue
+		}
+		if buf == nil {
+			buf = make([]byte, archive.blockSize)
 		}
 		if err := whisper.fileReadAt(buf, int64(archive.blockOffset(block.index))); err != nil {
 			return nil, fmt.Errorf("read block %d: %w", block.index, err)
@@ -636,13 +818,11 @@ func (whisper *Whisper) storedPoints(archive *archiveInfo, from, until int) ([]d
 			return nil, fmt.Errorf("read block %d: %w", block.index, err)
 		}
 
-		for i := range buf {
-			buf[i] = 0
-		}
 	}
 
 	if archive.hasBuffer() {
-		for _, p := range unpackDataPoints(archive.buffer) {
+		for offset := 0; offset < len(archive.buffer); offset += PointSize {
+			p := unpackDataPoint(archive.buffer[offset:])
 			if p.interval != 0 && from <= p.interval && p.interval <= until {
 				dst = append(dst, p)
 			}
@@ -654,28 +834,32 @@ func (whisper *Whisper) storedPoints(archive *archiveInfo, from, until int) ([]d
 
 // windowsOf returns the distinct next-archive window starts that points fall
 // into, ascending.
-func windowsOf(archive *archiveInfo, points []dataPoint) []int {
-	if archive.next == nil || len(points) == 0 {
+func windowsOf(archive *archiveInfo, lists ...[]dataPoint) []int {
+	if archive.next == nil {
 		return nil
 	}
 
-	seen := make(map[int]struct{}, len(points))
 	var starts []int
-	for _, p := range points {
-		if p.interval <= 0 {
-			continue
+	for _, points := range lists {
+		for _, p := range points {
+			if p.interval <= 0 {
+				continue
+			}
+			start := archive.AggregateInterval(p.interval)
+			if len(starts) == 0 || starts[len(starts)-1] != start {
+				starts = append(starts, start)
+			}
 		}
-		start := archive.AggregateInterval(p.interval)
-		if _, ok := seen[start]; ok {
-			continue
-		}
-		seen[start] = struct{}{}
-		starts = append(starts, start)
+
 	}
-
 	sort.Ints(starts)
-
-	return starts
+	unique := starts[:0]
+	for _, start := range starts {
+		if len(unique) == 0 || unique[len(unique)-1] != start {
+			unique = append(unique, start)
+		}
+	}
+	return unique
 }
 
 // spanOf returns the inclusive interval range covered by the given point lists.
@@ -698,33 +882,66 @@ func spanOf(lists ...[]dataPoint) (from, until int, ok bool) {
 	return from, until, ok
 }
 
-// readArchivePoints returns every live point in archive index of a classic
+// readArchivePointsAt returns every live point in archive index of a classic
 // whisper file, ascending by interval.
-func readArchivePoints(w *Whisper, index int) ([]dataPoint, error) {
+func readArchivePointsAt(w *Whisper, index int, now time.Time) ([]dataPoint, error) {
+	// Fine corrections can outlive their own retention while still affecting
+	// retained coarse aggregates. Collision replay materializes them before
+	// a physical slot is overwritten.
+	return readArchivePointsInRange(w, index, int(now.Unix())-w.maxRetention, maxInt)
+}
+
+// Read only the circular spans that can contribute to the requested windows.
+// Scratch remains bounded even for a sparse sidecar with very long retentions.
+func readArchivePointsInRange(w *Whisper, index, from, until int) ([]dataPoint, error) {
 	archive := w.archives[index]
-
-	// the whole archive at once: ~12 bytes per slot, so tens of MB for a long
-	// retention. Acceptable for an explicit, rate-limited maintenance op that
-	// is about to decompress the entire main file anyway.
-	buf := make([]byte, archive.Size())
-	if err := w.fileReadAt(buf, archive.Offset()); err != nil {
-		return nil, fmt.Errorf("read archive %d: %w", index, err)
+	if until < from {
+		return nil, nil
 	}
-
-	// a classic archive is a ring buffer: unwritten slots are zero, and slots
-	// not yet overwritten since the last wrap hold points older than retention
-	oldest := int(Now().Unix()) - archive.MaxRetention()
-
-	var points []dataPoint
-	for _, p := range unpackDataPoints(buf) {
-		if p.interval <= 0 || p.interval <= oldest {
-			continue
+	from += mod(-from, archive.secondsPerPoint)
+	if until < from {
+		return nil, nil
+	}
+	offset, remaining := archive.Offset(), archive.Size()
+	if from >= 0 && until-from < archive.MaxRetention()-archive.secondsPerPoint {
+		base := w.getBaseInterval(archive)
+		if base == 0 {
+			return nil, nil
 		}
-		points = append(points, p)
+		offset = archive.PointOffset(base, from)
+		remaining = ((until-from)/archive.secondsPerPoint + 1) * PointSize
 	}
-
+	bufferSize := 4096 * PointSize
+	if remaining < bufferSize {
+		bufferSize = remaining
+	}
+	buf := make([]byte, bufferSize)
+	var points []dataPoint
+	for remaining > 0 {
+		size := len(buf)
+		if size > remaining {
+			size = remaining
+		}
+		if int64(size) > archive.End()-offset {
+			size = int(archive.End() - offset)
+		}
+		chunk := buf[:size]
+		if err := w.fileReadAt(chunk, offset); err != nil {
+			return nil, fmt.Errorf("read archive %d: %w", index, err)
+		}
+		for i := 0; i < len(chunk); i += PointSize {
+			p := unpackDataPoint(chunk[i : i+PointSize])
+			if p.interval > 0 && p.interval >= from && p.interval <= until {
+				points = append(points, p)
+			}
+		}
+		remaining -= size
+		offset += int64(size)
+		if offset == archive.End() {
+			offset = archive.Offset()
+		}
+	}
 	sort.Slice(points, func(i, j int) bool { return points[i].interval < points[j].interval })
-
 	return points, nil
 }
 
@@ -733,8 +950,13 @@ func readArchivePoints(w *Whisper, index int) ([]dataPoint, error) {
 func (whisper *Whisper) OutOfOrderPath() string { return whisper.oooPath }
 
 // OutOfOrderSidecarPath returns the sidecar path belonging to the whisper file
-// at path. The file need not exist.
-func OutOfOrderSidecarPath(path string) string { return path + oooSuffix }
+// at path. The file need not exist. Paths near the filename limit use a stable
+// hashed filename in the same directory.
+func OutOfOrderSidecarPath(path string) string { return auxiliaryPath(path, oooSuffix) }
+
+// PathLockPath returns the persistent lock file that FLock uses for the whisper
+// file at path. External tools must lock it to coordinate across rewrites.
+func PathLockPath(path string) string { return auxiliaryPath(path, lockSuffix) }
 
 // RemoveOutOfOrderSidecar deletes the sidecar belonging to the whisper file at
 // path, and reports whether there was one. A missing sidecar is not an error.
