@@ -110,9 +110,11 @@ func newCluster(masterHostport string) (*ClusterConfig, error) {
 func isHealthy(master *hashing.JSONRingType, ring []*hashing.JSONRingType) bool {
 	var masterInRing bool
 	for _, member := range ring {
+		if member == nil {
+			return false
+		}
 		if member.Name == master.Name {
 			masterInRing = true
-			break
 		}
 	}
 
