@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -98,11 +99,16 @@ func listMetrics(w http.ResponseWriter, r *http.Request) {
 func serveMetrics(w http.ResponseWriter, r *http.Request) {
 
 	metric := r.URL.Path[len("/metrics/"):]
-	path := MetricToPath(metric)
 	if len(metric) == 0 {
 		http.Error(w, "Metric name missing.", http.StatusBadRequest)
 		return
 	}
+	// Validate before conversion can normalize path syntax into another metric.
+	if strings.ContainsAny(metric, "/\\\x00") {
+		http.Error(w, "Invalid metric path.", http.StatusBadRequest)
+		return
+	}
+	path := MetricToPath(metric)
 
 	switch r.Method {
 	case "HEAD":
