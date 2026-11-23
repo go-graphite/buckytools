@@ -2,6 +2,7 @@
 *.pickle
 *.line
 /bucky
+/bucky2
 /bucky-fill
 /bucky-isempty
 /bucky-pickle-relay

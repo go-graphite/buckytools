@@ -2,6 +2,10 @@
 
 This changelog documents specific changes added by `go-graphite` project members to this repo.
 
+## Unreleased
+
+* bucky2: client for go-carbon's Pebble store over the embedded buckyd API (rsync-like sync, cache guard)
+
 ## [0.5.2-gg] - 2021-11-17
 
 * Support cwhipser format by @bom-d-van in https://github.com/go-graphite/buckytools/pull/11

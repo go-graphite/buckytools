@@ -182,6 +182,62 @@ writes cause HTTP 409 and retain the source. Failed copy/delete jobs remain
 retryable. File daemons without a version retain their existing behavior. The
 standalone buckyd implementation is unchanged; it must not open a shared store.
 
+bucky2: client for go-carbon's Pebble store
+-------------------------------------------
+
+**bucky2** is the bucky client for go-carbon nodes that keep metrics in the
+Pebble store (`storage-backend = "pebble-chunk"`). It talks only to the buckyd
+API embedded in go-carbon (default port 4242); go-carbon must be running on
+every node involved. Commands and flags follow bucky:
+
+    bucky2 servers      -h graphite010-g5:4242
+    bucky2 list         -h graphite010-g5:4242 -r '^carbon\.'
+    bucky2 inconsistent -h graphite010-g5:4242
+    bucky2 rebalance    -h graphite010-g5:4242 -w 5 -delete
+    bucky2 backfill     -src-cluster-seed a:4242 -dst-cluster-seed b:4242
+    bucky2 copy         -src a:4242 -dst b:4242 -f names.txt
+
+`rebalance`, `backfill` and `copy` work like rsync. For each batch of names
+(`-batch`, default 1000) the destination compares per-archive digests with the
+source and pulls only the metrics that differ; existing destination points
+win. A rerun therefore skips everything already in place, so there is no job
+state file.
+
+`-delete` removes a source copy only for a metric that was absent on the
+destination and copied whole, and only if the source was not written since.
+A metric that already existed on the destination (`equal` or `merged`) is
+synced but kept on the source: a digest ends at the daemon's clock and a merge
+can drop a point into an occupied slot, so neither proves that every stored
+source point arrived (a future-dated point, for example). Such metrics are
+reported as `kept_on_source` and make the run exit non-zero. A rerun after an
+interrupted `-delete` run still deletes the metrics the earlier run copied:
+go-carbon recovers the proof from its import receipt as long as neither the
+source nor the destination copy was written since. A destination that has
+started receiving the metric's live points therefore keeps the source copy.
+`-delete` needs go-carbon with `SyncRecover` on every destination and refuses
+to start otherwise. `copy` with explicit names fails when one of them does not
+exist on the source. Draining a node
+onto destinations that do not hold its metrics deletes everything; removing
+duplicates that exist on both sides is not supported yet.
+
+* `-settle` (default 10m) ignores the newest points when comparing, so live
+  tails on replicas do not count as differences.
+* `-from` / `-until` (Unix seconds) compare a time window only, to repair an
+  outage. A metric that differs inside the window is still merged whole.
+* The destination must trust the source: it has to be a ring node or listed
+  in `transfer-sources` of the destination's `[buckyd]` config.
+* Renaming metrics is not supported.
+
+The go-carbon cache guard is on by default (`-go-carbon-health-check`). bucky2
+polls `/admin/info?scopes=cache` on every source and destination
+(`-go-carbon-port`, default 8080). When a write cache fills above
+`-go-carbon-cache-threshold` (default 0.75) each poll halves the number of
+batches allowed to touch that node; at 95% the node is paused until it is
+back under the threshold; below the threshold the allowance grows by one per
+poll up to `-w`. `-go-carbon-cache-threshold 0` disables the guard. go-carbon
+additionally answers 429 under Pebble pressure, which bucky2 retries with
+backoff.
+
 The **bucky** tool is self documenting.  You can run:
 
     bucky help

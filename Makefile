@@ -1,5 +1,5 @@
 RM = rm -f
-targets=bucky  bucky-fill  bucky-isempty  bucky-pickle-relay  bucky-sparsify  buckyd  findhash  gentestmetrics
+targets=bucky  bucky2  bucky-fill  bucky-isempty  bucky-pickle-relay  bucky-sparsify  buckyd  findhash  gentestmetrics
 
 SHELL := /bin/bash
 OS := $(shell uname)
@@ -9,6 +9,9 @@ PHONY: all
 all: $(targets)
 
 bucky:
+	go build -mod vendor ./cmd/$@
+
+bucky2:
 	go build -mod vendor ./cmd/$@
 
 bucky-fill:
