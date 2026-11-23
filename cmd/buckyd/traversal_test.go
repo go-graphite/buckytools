@@ -99,3 +99,24 @@ func TestServeMetricsValidPaths(t *testing.T) {
 		})
 	}
 }
+
+func TestServeMetricsValidPathsAtRoot(t *testing.T) {
+	oldPrefix, oldSecret := Prefix, authJWTSecretKey
+	authJWTSecretKey = nil
+	t.Cleanup(func() { Prefix, authJWTSecretKey = oldPrefix, oldSecret })
+
+	root := t.TempDir()
+	t.Chdir(root)
+	metric := filepath.Base(filepath.Dir(root)) + ".missing"
+	for _, prefix := range []string{".", string(filepath.Separator)} {
+		t.Run(prefix, func(t *testing.T) {
+			Prefix = prefix
+			r := httptest.NewRequest(http.MethodHead, "/metrics/"+metric, nil)
+			w := httptest.NewRecorder()
+			serveMetrics(w, r)
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("HEAD status = %d, want 404", w.Code)
+			}
+		})
+	}
+}

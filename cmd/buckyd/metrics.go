@@ -109,6 +109,11 @@ func serveMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := MetricToPath(metric)
+	relativePath, err := filepath.Rel(Prefix, path)
+	if err != nil || !filepath.IsLocal(relativePath) || relativePath == "." {
+		http.Error(w, "Invalid metric path.", http.StatusBadRequest)
+		return
+	}
 
 	switch r.Method {
 	case "HEAD":
